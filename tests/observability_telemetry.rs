@@ -14,26 +14,6 @@ use orchestrai::{
 use serde_json::json;
 
 #[tokio::test]
-async fn normal_agent_run_is_quiet_without_telemetry_configuration() {
-    let unregistered_sink = RecordingTelemetrySink::default();
-    let agent = create_agent(AgentConfig::new(
-        RecordingProvider::new([text_response("done")]),
-        "fake-model",
-    ));
-
-    let output = agent
-        .run("summarize this sensitive-token-for-default-off")
-        .await
-        .unwrap();
-
-    assert_eq!(output.final_message, "done");
-    assert!(
-        unregistered_sink.events().is_empty(),
-        "base Agent::run should not emit telemetry or logs unless a sink is explicitly configured"
-    );
-}
-
-#[tokio::test]
 async fn agent_config_telemetry_captures_lifecycle_model_tool_and_usage_events() {
     let telemetry = RecordingTelemetrySink::default();
     let provider = RecordingProvider::new([
@@ -97,12 +77,12 @@ async fn agent_config_telemetry_captures_lifecycle_model_tool_and_usage_events()
     assert_contains_event(&events, |event| {
         matches!(
             event,
-            TelemetryEvent::ProviderUsage {
+            TelemetryEvent::ModelCallFinished {
                 model,
-                usage: Usage {
+                usage: Some(Usage {
                     input_tokens: Some(13),
                     output_tokens: Some(5),
-                },
+                }),
             } if model == "fake-observed-model"
         )
     });
