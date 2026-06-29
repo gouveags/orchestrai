@@ -11,7 +11,7 @@ use futures_util::stream;
 use orchestrai::{
     AgentConfig, FnTool, LoopError, Message, ModelProvider, ModelRequest, ModelResponse,
     ModelStream, ModelStreamEvent, ProviderResult, ToolCall, ToolDefinition, ToolError, Usage,
-    UsageLimits, UsageMeter, UsageSnapshot, create_agent,
+    UsageLimitKind, UsageLimits, UsageMeter, UsageSnapshot, create_agent,
 };
 use serde_json::{Value, json};
 
@@ -49,7 +49,7 @@ async fn run_exposes_usage_snapshot_and_updates_shared_meter_from_full_responses
 }
 
 #[tokio::test]
-async fn run_stream_aggregates_usage_events_into_the_same_snapshot_contract() {
+async fn run_stream_uses_the_last_cumulative_usage_snapshot_for_each_model_call() {
     let meter = UsageMeter::default();
     let agent = create_agent(
         AgentConfig::new(
@@ -61,11 +61,13 @@ async fn run_stream_aggregates_usage_events_into_the_same_snapshot_contract() {
                         name: Some("lookup".to_owned()),
                         arguments_delta: r#"{"id":"acct_1"}"#.to_owned(),
                     },
+                    ModelStreamEvent::Usage(usage(2, 1)),
                     ModelStreamEvent::Usage(usage(4, 2)),
                     ModelStreamEvent::Done,
                 ],
                 vec![
                     ModelStreamEvent::MessageDelta("ready".to_owned()),
+                    ModelStreamEvent::Usage(usage(5, 4)),
                     ModelStreamEvent::Usage(usage(9, 6)),
                     ModelStreamEvent::Done,
                 ],
@@ -109,7 +111,10 @@ async fn run_limit_fails_closed_before_the_provider_is_called() {
 
     assert!(matches!(
         error,
-        LoopError::UsageLimitExceeded { limit, .. } if limit == "runs"
+        LoopError::UsageLimitExceeded {
+            kind: UsageLimitKind::Runs,
+            ..
+        }
     ));
     assert!(requests.lock().unwrap().is_empty());
     assert_eq!(meter.snapshot(), UsageSnapshot::default());
@@ -138,9 +143,66 @@ async fn exhausted_token_budget_fails_before_another_expensive_provider_call() {
 
     assert!(matches!(
         error,
-        LoopError::UsageLimitExceeded { limit, .. } if limit == "total_tokens"
+        LoopError::UsageLimitExceeded {
+            kind: UsageLimitKind::TotalTokens,
+            ..
+        }
     ));
     assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn token_limit_reached_after_provider_response_stops_tools_and_next_provider_call() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    let meter = UsageMeter::default();
+    let tool_counter = Arc::clone(&tool_calls);
+    let agent = create_agent(
+        AgentConfig::new(
+            FakeProvider::responses(
+                vec![
+                    tool_response("call_1", "expensive_lookup", json!({})).with_usage(8, 2),
+                    text_response("should not run").with_usage(1, 1),
+                ],
+                Arc::clone(&requests),
+            ),
+            "fake-model",
+        )
+        .with_usage_meter(meter.clone())
+        .with_usage_limits(UsageLimits::default().with_max_total_tokens(10))
+        .with_tool(FnTool::new(
+            ToolDefinition::new("expensive_lookup", "Should not execute.", json!({})),
+            move |_arguments| {
+                let tool_counter = Arc::clone(&tool_counter);
+                Box::pin(async move {
+                    tool_counter.fetch_add(1, Ordering::SeqCst);
+                    Ok("tool result should not be visible".to_owned())
+                })
+            },
+        )),
+    );
+
+    let error = agent.run("use the expensive lookup").await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        LoopError::UsageLimitExceeded {
+            kind: UsageLimitKind::TotalTokens,
+            ..
+        }
+    ));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        meter.snapshot(),
+        UsageSnapshot {
+            runs: 1,
+            model_calls: 1,
+            tool_calls: 0,
+            input_tokens: 8,
+            output_tokens: 2,
+        }
+    );
 }
 
 #[tokio::test]
