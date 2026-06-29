@@ -10,8 +10,10 @@ pub mod providers;
 pub mod run_state;
 pub mod subagents;
 pub mod summarization;
+pub mod telemetry;
 pub mod tool;
 pub mod types;
+pub mod usage;
 
 #[cfg(feature = "python")]
 pub mod python;
@@ -41,5 +43,7 @@ pub use run_state::{
 };
 pub use subagents::DefaultSubAgentTool;
 pub use summarization::{ConversationSummary, PreparedMessages, SummaryPolicy};
+pub use telemetry::{TelemetryConfig, TelemetryEvent, TelemetrySink};
 pub use tool::{FnTool, Tool, ToolError, ToolRegistry};
 pub use types::{ContentBlock, Message, Role, ToolCall, ToolDefinition, ToolResult, Usage};
+pub use usage::{UsageLimitKind, UsageLimits, UsageMeter, UsageSnapshot};

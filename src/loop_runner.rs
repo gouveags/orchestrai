@@ -8,8 +8,10 @@ use crate::{
     provider::{ModelProvider, ModelRequest, ModelResponse, ModelStreamEvent, ProviderError},
     run_state::{BeforeModelCall, ModelCallConfig, RunState, StateInstructionPolicy},
     summarization::{ConversationSummary, PreparedMessages, SummaryPolicy},
+    telemetry::{TelemetryConfig, TelemetryEvent},
     tool::{ToolError, ToolRegistry},
     types::{Message, Role, ToolCall, ToolResult},
+    usage::{UsageLimitError, UsageLimitKind, UsageLimits, UsageMeter, UsageSnapshot},
 };
 
 pub(crate) type BeforeModelCallHook = Arc<
@@ -36,6 +38,9 @@ pub struct AgentLoopConfig {
     pub summary_policy: Option<SummaryPolicy>,
     pub capability_bundles: CapabilityBundleSet,
     pub cache_policy: CachePolicy,
+    pub telemetry: TelemetryConfig,
+    pub usage_meter: UsageMeter,
+    pub usage_limits: UsageLimits,
 }
 
 impl AgentLoopConfig {
@@ -47,6 +52,9 @@ impl AgentLoopConfig {
             summary_policy: None,
             capability_bundles: CapabilityBundleSet::new(),
             cache_policy: CachePolicy::disabled(),
+            telemetry: TelemetryConfig::default(),
+            usage_meter: UsageMeter::default(),
+            usage_limits: UsageLimits::default(),
         }
     }
 
@@ -72,6 +80,21 @@ impl AgentLoopConfig {
 
     pub fn with_cache_policy(mut self, cache_policy: CachePolicy) -> Self {
         self.cache_policy = cache_policy;
+        self
+    }
+
+    pub fn with_telemetry(mut self, telemetry: TelemetryConfig) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
+    pub fn with_usage_meter(mut self, usage_meter: UsageMeter) -> Self {
+        self.usage_meter = usage_meter;
+        self
+    }
+
+    pub fn with_usage_limits(mut self, usage_limits: UsageLimits) -> Self {
+        self.usage_limits = usage_limits;
         self
     }
 }
@@ -104,12 +127,28 @@ where
         messages: Vec<Message>,
         selection: CapabilitySelection,
     ) -> Result<LoopOutput, LoopError> {
+        let mut usage_snapshot = self.start_run()?;
+        let output = self
+            .run_with_capabilities_inner(messages, selection, &mut usage_snapshot)
+            .await;
+        self.finish_run(output.is_ok());
+        output
+    }
+
+    async fn run_with_capabilities_inner(
+        &self,
+        messages: Vec<Message>,
+        selection: CapabilitySelection,
+        usage_snapshot: &mut UsageSnapshot,
+    ) -> Result<LoopOutput, LoopError> {
         let context = self.run_context(&selection)?;
         let mut messages = apply_capability_prompts(messages, &context.prompts);
         let mut all_tool_results = Vec::new();
 
         for _round in 0..=self.config.max_tool_rounds {
-            let model_call = self.call_model(messages.clone(), &context.tools).await?;
+            let model_call = self
+                .call_model(messages.clone(), &context.tools, usage_snapshot)
+                .await?;
             let injected_summary = model_call.injected_summary;
             let response = model_call.response;
             messages.push(Message::assistant_with_tool_calls(
@@ -123,11 +162,12 @@ where
                     messages,
                     tool_results: all_tool_results,
                     injected_summary,
+                    usage_snapshot: *usage_snapshot,
                 });
             }
 
             let tool_results = self
-                .execute_tool_calls(&response.tool_calls, &context.tools)
+                .execute_tool_calls(&response.tool_calls, &context.tools, usage_snapshot)
                 .await?;
             for result in &tool_results {
                 messages.push(Message::tool(
@@ -147,6 +187,21 @@ where
         state: RunState,
         options: RunStateCallOptions,
     ) -> Result<LoopOutput, LoopError> {
+        let mut usage_snapshot = self.start_run()?;
+        let output = self
+            .run_with_state_inner(messages, state, options, &mut usage_snapshot)
+            .await;
+        self.finish_run(output.is_ok());
+        output
+    }
+
+    async fn run_with_state_inner(
+        &self,
+        messages: Vec<Message>,
+        state: RunState,
+        options: RunStateCallOptions,
+        usage_snapshot: &mut UsageSnapshot,
+    ) -> Result<LoopOutput, LoopError> {
         let context = self.run_context(&CapabilitySelection::default())?;
         let mut messages = apply_capability_prompts(messages, &context.prompts);
         let mut state = state;
@@ -154,7 +209,13 @@ where
 
         for _round in 0..=self.config.max_tool_rounds {
             let model_call = self
-                .call_model_with_state(messages.clone(), &mut state, &options, &context.tools)
+                .call_model_with_state(
+                    messages.clone(),
+                    &mut state,
+                    &options,
+                    &context.tools,
+                    usage_snapshot,
+                )
                 .await?;
             let injected_summary = model_call.injected_summary;
             let response = model_call.response;
@@ -169,11 +230,12 @@ where
                     messages,
                     tool_results: all_tool_results,
                     injected_summary,
+                    usage_snapshot: *usage_snapshot,
                 });
             }
 
             let tool_results = self
-                .execute_tool_calls(&response.tool_calls, &context.tools)
+                .execute_tool_calls(&response.tool_calls, &context.tools, usage_snapshot)
                 .await?;
             for result in &tool_results {
                 messages.push(Message::tool(
@@ -196,6 +258,24 @@ where
         F: FnMut(LoopEvent) -> Fut + Send,
         Fut: std::future::Future<Output = ()> + Send,
     {
+        let mut usage_snapshot = self.start_run()?;
+        let output = self
+            .run_stream_inner(messages, &mut on_event, &mut usage_snapshot)
+            .await;
+        self.finish_run(output.is_ok());
+        output
+    }
+
+    async fn run_stream_inner<F, Fut>(
+        &self,
+        messages: Vec<Message>,
+        on_event: &mut F,
+        usage_snapshot: &mut UsageSnapshot,
+    ) -> Result<LoopOutput, LoopError>
+    where
+        F: FnMut(LoopEvent) -> Fut + Send,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
         let context = self.run_context(&CapabilitySelection::default())?;
         let mut messages = apply_capability_prompts(messages, &context.prompts);
         let mut all_tool_results = Vec::new();
@@ -203,6 +283,11 @@ where
         for _round in 0..=self.config.max_tool_rounds {
             let prepared = self.request(messages.clone(), &context.tools)?;
             let injected_summary = prepared.injected_summary;
+            let model = prepared.request.model.clone();
+            self.ensure_model_call_allowed()?;
+            self.record_telemetry(TelemetryEvent::ModelCallStarted {
+                model: model.clone(),
+            });
             let mut stream = self
                 .provider
                 .stream(prepared.request)
@@ -244,6 +329,12 @@ where
             }
 
             let response = aggregation.finish()?;
+            self.record_telemetry(TelemetryEvent::ModelCallFinished {
+                model,
+                usage: response.usage.clone(),
+            });
+            let delta = self.record_model_usage(&response);
+            usage_snapshot.add_assign(delta);
             messages.push(Message::assistant_with_tool_calls(
                 response.message.clone(),
                 response.tool_calls.clone(),
@@ -256,6 +347,7 @@ where
                     messages,
                     tool_results: all_tool_results,
                     injected_summary,
+                    usage_snapshot: *usage_snapshot,
                 });
             }
 
@@ -266,7 +358,9 @@ where
                 })
                 .await;
 
-                let result = self.execute_tool_call(call, &context.tools).await?;
+                let result = self
+                    .execute_tool_call(call, &context.tools, usage_snapshot)
+                    .await?;
 
                 on_event(LoopEvent::ToolFinished {
                     tool_call_id: result.tool_call_id.clone(),
@@ -289,13 +383,25 @@ where
         &self,
         messages: Vec<Message>,
         tools: &ToolRegistry,
+        usage_snapshot: &mut UsageSnapshot,
     ) -> Result<ModelCall, LoopError> {
         let prepared = self.request(messages, tools)?;
+        self.ensure_model_call_allowed()?;
+        let model = prepared.request.model.clone();
+        self.record_telemetry(TelemetryEvent::ModelCallStarted {
+            model: model.clone(),
+        });
         let response = self
             .provider
             .complete(prepared.request)
             .await
             .map_err(LoopError::Provider)?;
+        self.record_telemetry(TelemetryEvent::ModelCallFinished {
+            model,
+            usage: response.usage.clone(),
+        });
+        let delta = self.record_model_usage(&response);
+        usage_snapshot.add_assign(delta);
 
         Ok(ModelCall {
             response,
@@ -309,15 +415,27 @@ where
         state: &mut RunState,
         options: &RunStateCallOptions,
         tools: &ToolRegistry,
+        usage_snapshot: &mut UsageSnapshot,
     ) -> Result<ModelCall, LoopError> {
         let prepared = self
             .request_with_state(messages, state, options, tools)
             .await?;
+        self.ensure_model_call_allowed()?;
+        let model = prepared.request.model.clone();
+        self.record_telemetry(TelemetryEvent::ModelCallStarted {
+            model: model.clone(),
+        });
         let response = self
             .provider
             .complete(prepared.request)
             .await
             .map_err(LoopError::Provider)?;
+        self.record_telemetry(TelemetryEvent::ModelCallFinished {
+            model,
+            usage: response.usage.clone(),
+        });
+        let delta = self.record_model_usage(&response);
+        usage_snapshot.add_assign(delta);
 
         Ok(ModelCall {
             response,
@@ -492,11 +610,12 @@ where
         &self,
         tool_calls: &[ToolCall],
         tools: &ToolRegistry,
+        usage_snapshot: &mut UsageSnapshot,
     ) -> Result<Vec<ToolResult>, LoopError> {
         let mut results = Vec::with_capacity(tool_calls.len());
 
         for call in tool_calls {
-            results.push(self.execute_tool_call(call, tools).await?);
+            results.push(self.execute_tool_call(call, tools, usage_snapshot).await?);
         }
 
         Ok(results)
@@ -506,16 +625,90 @@ where
         &self,
         call: &ToolCall,
         tools: &ToolRegistry,
+        usage_snapshot: &mut UsageSnapshot,
     ) -> Result<ToolResult, LoopError> {
+        self.ensure_tool_call_allowed()?;
+        self.record_telemetry(TelemetryEvent::ToolCallStarted {
+            tool_call_id: call.id.clone(),
+            name: call.name.clone(),
+        });
+
         match tools.execute(&call.name, call.arguments.clone()).await {
-            Ok(content) => Ok(ToolResult::ok(call.id.clone(), call.name.clone(), content)),
-            Err(ToolError::ResultContent(content)) => Ok(ToolResult::error(
-                call.id.clone(),
-                call.name.clone(),
-                content,
-            )),
-            Err(error) => Err(LoopError::Tool(error)),
+            Ok(content) => {
+                let delta = self.config.usage_meter.record_tool_call();
+                usage_snapshot.add_assign(delta);
+                self.record_telemetry(TelemetryEvent::ToolCallFinished {
+                    tool_call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    is_error: false,
+                    recoverable: false,
+                });
+                Ok(ToolResult::ok(call.id.clone(), call.name.clone(), content))
+            }
+            Err(ToolError::ResultContent(content)) => {
+                let delta = self.config.usage_meter.record_tool_call();
+                usage_snapshot.add_assign(delta);
+                self.record_telemetry(TelemetryEvent::ToolCallFinished {
+                    tool_call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    is_error: true,
+                    recoverable: true,
+                });
+                Ok(ToolResult::error(
+                    call.id.clone(),
+                    call.name.clone(),
+                    content,
+                ))
+            }
+            Err(error) => {
+                let delta = self.config.usage_meter.record_tool_call();
+                usage_snapshot.add_assign(delta);
+                self.record_telemetry(TelemetryEvent::ToolCallFinished {
+                    tool_call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    is_error: true,
+                    recoverable: false,
+                });
+                Err(LoopError::Tool(error))
+            }
         }
+    }
+
+    fn start_run(&self) -> Result<UsageSnapshot, LoopError> {
+        let delta = self
+            .config
+            .usage_meter
+            .reserve_run(&self.config.usage_limits)?;
+        self.record_telemetry(TelemetryEvent::RunStarted);
+        Ok(delta)
+    }
+
+    fn finish_run(&self, success: bool) {
+        self.record_telemetry(TelemetryEvent::RunFinished { success });
+    }
+
+    fn ensure_model_call_allowed(&self) -> Result<(), LoopError> {
+        self.config
+            .usage_meter
+            .ensure_model_call_allowed(&self.config.usage_limits)
+            .map_err(LoopError::from)
+    }
+
+    fn ensure_tool_call_allowed(&self) -> Result<(), LoopError> {
+        self.config
+            .usage_meter
+            .ensure_tool_call_allowed(&self.config.usage_limits)
+            .map_err(LoopError::from)
+    }
+
+    fn record_model_usage(&self, response: &ModelResponse) -> UsageSnapshot {
+        self.config
+            .usage_meter
+            .record_model_call(response.usage.as_ref())
+    }
+
+    fn record_telemetry(&self, event: TelemetryEvent) {
+        self.config.telemetry.record(event);
     }
 }
 
@@ -540,6 +733,13 @@ pub struct LoopOutput {
     pub messages: Vec<Message>,
     pub tool_results: Vec<ToolResult>,
     pub injected_summary: Option<ConversationSummary>,
+    usage_snapshot: UsageSnapshot,
+}
+
+impl LoopOutput {
+    pub fn usage_snapshot(&self) -> UsageSnapshot {
+        self.usage_snapshot
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -579,6 +779,22 @@ pub enum LoopError {
     TooManyToolRounds(usize),
     #[error("streamed tool call `{0}` did not include valid JSON arguments: {1}")]
     InvalidToolArguments(String, serde_json::Error),
+    #[error("usage limit exceeded for {kind:?}: current {current}, limit {limit}")]
+    UsageLimitExceeded {
+        kind: UsageLimitKind,
+        limit: u64,
+        current: u64,
+    },
+}
+
+impl From<UsageLimitError> for LoopError {
+    fn from(error: UsageLimitError) -> Self {
+        Self::UsageLimitExceeded {
+            kind: error.kind,
+            limit: error.limit,
+            current: error.current,
+        }
+    }
 }
 
 fn apply_capability_prompts(mut messages: Vec<Message>, prompts: &[String]) -> Vec<Message> {
@@ -601,6 +817,7 @@ fn apply_capability_prompts(mut messages: Vec<Message>, prompts: &[String]) -> V
 struct StreamAggregation {
     message: String,
     tool_calls: Vec<PartialToolCall>,
+    usage: Option<crate::types::Usage>,
 }
 
 impl StreamAggregation {
@@ -625,7 +842,10 @@ impl StreamAggregation {
                 }
                 call.arguments.push_str(arguments_delta);
             }
-            ModelStreamEvent::Usage(_) | ModelStreamEvent::Done => {}
+            ModelStreamEvent::Usage(usage) => {
+                self.usage = Some(usage.clone());
+            }
+            ModelStreamEvent::Done => {}
         }
         Ok(())
     }
@@ -651,7 +871,7 @@ impl StreamAggregation {
         Ok(ModelResponse {
             message: self.message,
             tool_calls,
-            usage: None,
+            usage: self.usage,
         })
     }
 }
