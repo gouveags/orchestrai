@@ -608,6 +608,53 @@ mod tests {
         tools
     }
 
+    #[tokio::test]
+    async fn run_returns_recoverable_tool_errors_as_tool_result_messages() {
+        let provider = FakeProvider::with_responses(vec![
+            ModelResponse {
+                message: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_owned(),
+                    name: "missing_file".to_owned(),
+                    arguments: json!({}),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                message: "I could not read it.".to_owned(),
+                tool_calls: Vec::new(),
+                usage: None,
+            },
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(FnTool::new(
+            ToolDefinition::new("missing_file", "Fails recoverably.", json!({})),
+            |_arguments| {
+                Box::pin(async {
+                    Err(ToolError::result_content(
+                        r#"{"error":"file was not found"}"#,
+                    ))
+                })
+            },
+        ));
+        let loop_runner = AgentLoop::new(provider, tools, AgentLoopConfig::new("fake"));
+
+        let output = loop_runner
+            .run(vec![Message::user("read it")])
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_message, "I could not read it.");
+        assert_eq!(
+            output.tool_results[0].content,
+            r#"{"error":"file was not found"}"#
+        );
+        assert_eq!(
+            output.messages[2].content,
+            r#"{"error":"file was not found"}"#
+        );
+    }
+
     struct FakeProvider {
         responses: Mutex<VecDeque<ModelResponse>>,
         streams: Mutex<VecDeque<Vec<ModelStreamEvent>>>,
