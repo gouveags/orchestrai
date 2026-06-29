@@ -6,8 +6,10 @@ use crate::{
     },
     provider::{CachePolicy, ModelProvider},
     run_state::{BeforeModelCall, RunOptions, RunState, StateInstructionPolicy},
+    telemetry::TelemetryConfig,
     tool::{Tool, ToolRegistry},
     types::Message,
+    usage::{UsageLimits, UsageMeter},
 };
 
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
@@ -33,6 +35,9 @@ pub struct AgentConfig<P> {
     pub(crate) run_state_instructions: Option<StateInstructionPolicy>,
     pub(crate) model_modes: BTreeMap<String, String>,
     pub(crate) before_model_call: Option<BeforeModelCallHook>,
+    pub(crate) telemetry: TelemetryConfig,
+    pub(crate) usage_meter: UsageMeter,
+    pub(crate) usage_limits: UsageLimits,
 }
 
 impl<P> AgentConfig<P> {
@@ -49,6 +54,9 @@ impl<P> AgentConfig<P> {
             run_state_instructions: None,
             model_modes: BTreeMap::new(),
             before_model_call: None,
+            telemetry: TelemetryConfig::default(),
+            usage_meter: UsageMeter::default(),
+            usage_limits: UsageLimits::default(),
         }
     }
 
@@ -119,6 +127,21 @@ impl<P> AgentConfig<P> {
         }));
         self
     }
+
+    pub fn with_telemetry(mut self, telemetry: TelemetryConfig) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
+    pub fn with_usage_meter(mut self, usage_meter: UsageMeter) -> Self {
+        self.usage_meter = usage_meter;
+        self
+    }
+
+    pub fn with_usage_limits(mut self, usage_limits: UsageLimits) -> Self {
+        self.usage_limits = usage_limits;
+        self
+    }
 }
 
 pub struct Agent<P> {
@@ -139,7 +162,10 @@ where
         }
         loop_config = loop_config
             .with_capability_bundles(config.capability_bundles)
-            .with_cache_policy(config.cache_policy);
+            .with_cache_policy(config.cache_policy)
+            .with_telemetry(config.telemetry)
+            .with_usage_meter(config.usage_meter)
+            .with_usage_limits(config.usage_limits);
 
         Self {
             loop_runner: AgentLoop::new(config.provider, config.tools, loop_config),
