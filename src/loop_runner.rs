@@ -165,13 +165,15 @@ where
                 });
             }
 
-            let tool_results = self.execute_tool_calls(&response.tool_calls).await?;
-            for result in &tool_results {
+            for call in &response.tool_calls {
                 on_event(LoopEvent::ToolStarted {
-                    tool_call_id: result.tool_call_id.clone(),
-                    name: result.name.clone(),
+                    tool_call_id: call.id.clone(),
+                    name: call.name.clone(),
                 })
                 .await;
+
+                let result = self.execute_tool_call(call).await?;
+
                 on_event(LoopEvent::ToolFinished {
                     tool_call_id: result.tool_call_id.clone(),
                     name: result.name.clone(),
@@ -182,8 +184,8 @@ where
                     result.tool_call_id.clone(),
                     result.content.clone(),
                 ));
+                all_tool_results.push(result);
             }
-            all_tool_results.extend(tool_results);
         }
 
         Err(LoopError::TooManyToolRounds(self.config.max_tool_rounds))
@@ -236,20 +238,22 @@ where
         let mut results = Vec::with_capacity(tool_calls.len());
 
         for call in tool_calls {
-            match self.tools.execute(&call.name, call.arguments.clone()).await {
-                Ok(content) => {
-                    results.push(ToolResult::ok(call.id.clone(), call.name.clone(), content))
-                }
-                Err(ToolError::ResultContent(content)) => results.push(ToolResult::error(
-                    call.id.clone(),
-                    call.name.clone(),
-                    content,
-                )),
-                Err(error) => return Err(LoopError::Tool(error)),
-            }
+            results.push(self.execute_tool_call(call).await?);
         }
 
         Ok(results)
+    }
+
+    async fn execute_tool_call(&self, call: &ToolCall) -> Result<ToolResult, LoopError> {
+        match self.tools.execute(&call.name, call.arguments.clone()).await {
+            Ok(content) => Ok(ToolResult::ok(call.id.clone(), call.name.clone(), content)),
+            Err(ToolError::ResultContent(content)) => Ok(ToolResult::error(
+                call.id.clone(),
+                call.name.clone(),
+                content,
+            )),
+            Err(error) => Err(LoopError::Tool(error)),
+        }
     }
 }
 
@@ -472,6 +476,64 @@ mod tests {
                 .contains(&LoopEvent::MessageDelta("The answer ".to_owned()))
         );
         assert!(events.lock().unwrap().contains(&LoopEvent::Done));
+    }
+
+    #[tokio::test]
+    async fn run_stream_emits_tool_started_before_executing_the_tool() {
+        let provider = FakeProvider::with_streams(vec![
+            vec![
+                ModelStreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".to_owned()),
+                    name: Some("record".to_owned()),
+                    arguments_delta: "{}".to_owned(),
+                },
+                ModelStreamEvent::Done,
+            ],
+            vec![
+                ModelStreamEvent::MessageDelta("done".to_owned()),
+                ModelStreamEvent::Done,
+            ],
+        ]);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolRegistry::new();
+        let tool_order = Arc::clone(&order);
+        tools.register(FnTool::new(
+            ToolDefinition::new("record", "Record execution order.", json!({})),
+            move |_arguments| {
+                let tool_order = Arc::clone(&tool_order);
+                Box::pin(async move {
+                    tool_order.lock().unwrap().push("tool-executed");
+                    Ok("recorded".to_owned())
+                })
+            },
+        ));
+        let loop_runner = AgentLoop::new(provider, tools, AgentLoopConfig::new("fake"));
+        let event_order = Arc::clone(&order);
+
+        let output = loop_runner
+            .run_stream(vec![Message::user("record")], move |event| {
+                let event_order = Arc::clone(&event_order);
+                async move {
+                    match event {
+                        LoopEvent::ToolStarted { .. } => {
+                            event_order.lock().unwrap().push("tool-started");
+                        }
+                        LoopEvent::ToolFinished { .. } => {
+                            event_order.lock().unwrap().push("tool-finished");
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_message, "done");
+        assert_eq!(
+            &*order.lock().unwrap(),
+            &["tool-started", "tool-executed", "tool-finished"]
+        );
     }
 
     #[tokio::test]
