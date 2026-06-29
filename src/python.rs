@@ -29,11 +29,7 @@ pub fn create_agent_py(
     max_tokens: Option<u32>,
     provider: &str,
 ) -> PyResult<PyAgent> {
-    if provider != "openai" {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "only provider='openai' is currently supported by the Python bindings",
-        ));
-    }
+    validate_provider(provider).map_err(pyo3::exceptions::PyValueError::new_err)?;
 
     let api_key = api_key
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
@@ -64,4 +60,30 @@ pub fn orchestrai(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 fn loop_error(error: LoopError) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
+}
+
+fn validate_provider(provider: &str) -> Result<(), &'static str> {
+    if provider == "openai" {
+        Ok(())
+    } else {
+        Err("only provider='openai' is currently supported by the Python bindings")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_provider_rejects_unsupported_provider() {
+        assert_eq!(
+            validate_provider("anthropic"),
+            Err("only provider='openai' is currently supported by the Python bindings")
+        );
+    }
+
+    #[test]
+    fn validate_provider_accepts_openai_provider() {
+        assert_eq!(validate_provider("openai"), Ok(()));
+    }
 }
