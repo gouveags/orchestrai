@@ -39,9 +39,10 @@ messages.
 provider requests. `LoopOutput.messages` remains the real transcript, and
 `LoopOutput.injected_summary` reports the summary context used for the call.
 
-Tool lookup and execution failures are returned to the agent as tool-result
-messages when possible, so the next model call can recover. Provider failures,
-invalid streamed tool arguments, and too many tool rounds still fail the loop.
+Tools can return `ToolError::result_content(...)` when the model should see the
+error and recover in the next loop turn. Unknown tools, hard execution failures,
+provider failures, invalid streamed tool arguments, and too many tool rounds
+fail the loop directly.
 
 ## Development
 

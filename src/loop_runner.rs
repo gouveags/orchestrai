@@ -230,11 +230,12 @@ where
                 Ok(content) => {
                     results.push(ToolResult::ok(call.id.clone(), call.name.clone(), content))
                 }
-                Err(error) => results.push(ToolResult::error(
+                Err(ToolError::ResultContent(content)) => results.push(ToolResult::error(
                     call.id.clone(),
                     call.name.clone(),
-                    error.to_string(),
+                    content,
                 )),
+                Err(error) => return Err(LoopError::Tool(error)),
             }
         }
 
@@ -378,7 +379,7 @@ mod tests {
     use crate::{
         provider::{ModelStream, ProviderResult},
         summarization::{ConversationSummary, SummaryPolicy},
-        tool::FnTool,
+        tool::{FnTool, ToolError},
         types::{Role, ToolDefinition},
     };
 
@@ -502,13 +503,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_returns_tool_failures_as_agent_visible_tool_results() {
+    async fn run_returns_recoverable_tool_errors_as_agent_visible_tool_results() {
         let provider = FakeProvider::with_responses(vec![
             ModelResponse {
                 message: String::new(),
                 tool_calls: vec![ToolCall {
                     id: "call_1".to_owned(),
-                    name: "missing_tool".to_owned(),
+                    name: "read_cache".to_owned(),
                     arguments: json!({}),
                 }],
                 usage: None,
@@ -519,8 +520,18 @@ mod tests {
                 usage: None,
             },
         ]);
-        let loop_runner =
-            AgentLoop::new(provider, ToolRegistry::new(), AgentLoopConfig::new("fake"));
+        let mut tools = ToolRegistry::new();
+        tools.register(FnTool::new(
+            ToolDefinition::new("read_cache", "Read cached content.", json!({})),
+            |_arguments| {
+                Box::pin(async {
+                    Err(ToolError::result_content(
+                        r#"{"error":"cache entry was not found"}"#,
+                    ))
+                })
+            },
+        ));
+        let loop_runner = AgentLoop::new(provider, tools, AgentLoopConfig::new("fake"));
 
         let output = loop_runner
             .run(vec![Message::user("try it")])
@@ -529,7 +540,34 @@ mod tests {
 
         assert_eq!(output.final_message, "I can recover from that tool error.");
         assert!(output.tool_results[0].is_error);
-        assert!(output.messages[2].content.contains("was not registered"));
+        assert_eq!(
+            output.messages[2].content,
+            r#"{"error":"cache entry was not found"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn run_fails_hard_when_the_model_requests_an_unknown_tool() {
+        let provider = FakeProvider::with_responses(vec![ModelResponse {
+            message: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_owned(),
+                name: "missing_tool".to_owned(),
+                arguments: json!({}),
+            }],
+            usage: None,
+        }]);
+        let loop_runner =
+            AgentLoop::new(provider, ToolRegistry::new(), AgentLoopConfig::new("fake"));
+
+        let error = loop_runner
+            .run(vec![Message::user("try it")])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, LoopError::Tool(ToolError::NotFound(name)) if name == "missing_tool")
+        );
     }
 
     fn math_tools() -> ToolRegistry {
