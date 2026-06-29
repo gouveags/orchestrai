@@ -107,6 +107,45 @@ instructions, tools, max tool rounds, and max tokens. `Agent::run_stream` emits
 the existing `LoopEvent` stream while preserving the same provider-backed loop
 behavior.
 
+## Observability and Usage Controls
+
+Telemetry is opt-in and sink-based. Core events describe run lifecycle, model
+calls, tool calls, and provider-reported token usage without recording raw
+prompts, tool arguments, or tool result content.
+
+```rust
+use orchestrai::{TelemetryConfig, TelemetryEvent, TelemetrySink};
+
+#[derive(Clone)]
+struct Logger;
+
+impl TelemetrySink for Logger {
+    fn record(&self, event: TelemetryEvent) {
+        println!("{event:?}");
+    }
+}
+
+let telemetry = TelemetryConfig::new().with_sink(Logger);
+```
+
+Usage accounting is also built into the base agent loop. `UsageMeter` can be
+shared across agents, `LoopOutput::usage_snapshot()` reports the per-run delta,
+and `UsageLimits` fails closed before provider calls when an existing budget is
+already exhausted.
+
+`UsageSnapshot.model_calls` counts logical orchestrai model requests made by the
+loop: one `ModelProvider::complete` or `ModelProvider::stream` invocation. It
+does not count provider-internal retry or fallback attempts inside an adapter.
+The loop reserves model and tool calls before awaiting provider or tool work so
+shared meters enforce call limits across concurrent runs.
+
+```rust
+use orchestrai::{UsageLimits, UsageMeter};
+
+let meter = UsageMeter::default();
+let limits = UsageLimits::default().with_max_total_tokens(10_000);
+```
+
 ## Python Bindings
 
 Python packaging is scaffolded with `pyo3` and `maturin` behind the `python`
