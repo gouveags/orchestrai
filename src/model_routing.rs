@@ -1,6 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
+use async_stream::try_stream;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::StatusCode;
 
 use crate::provider::{
@@ -164,24 +166,53 @@ impl ModelProvider for RoutedModelProvider {
 
     async fn stream(&self, request: ModelRequest) -> ProviderResult<ModelStream> {
         let route = self.route_for(&request.model)?;
+        let attempts = route
+            .iter()
+            .map(|provider_model| {
+                self.provider(&provider_model.provider)
+                    .map(|provider| (provider_model.clone(), provider))
+            })
+            .collect::<ProviderResult<Vec<_>>>()?;
         let last_index = route.len() - 1;
+        let fallback_policy = self.fallback_policy;
 
-        for (index, provider_model) in route.iter().enumerate() {
-            let provider = self.provider(&provider_model.provider)?;
-            let routed_request = request_for_model(&request, &provider_model.model);
+        Ok(Box::pin(try_stream! {
+            for (index, (provider_model, provider)) in attempts.iter().enumerate() {
+                let routed_request = request_for_model(&request, &provider_model.model);
+                let mut stream = match provider.stream(routed_request).await {
+                    Ok(stream) => stream,
+                    Err(error)
+                        if fallback_policy.should_try_next(&error) && index < last_index =>
+                    {
+                        continue;
+                    }
+                    Err(error) => Err(error)?,
+                };
+                let mut emitted = false;
+                let mut should_try_next = false;
 
-            match provider.stream(routed_request).await {
-                Ok(stream) => return Ok(stream),
-                Err(error)
-                    if self.fallback_policy.should_try_next(&error) && index < last_index =>
-                {
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(event) => {
+                            emitted = true;
+                            yield event;
+                        }
+                        Err(error)
+                            if !emitted && fallback_policy.should_try_next(&error) && index < last_index =>
+                        {
+                            should_try_next = true;
+                            break;
+                        }
+                        Err(error) => Err(error)?,
+                    }
+                }
+
+                if should_try_next {
                     continue;
                 }
-                Err(error) => return Err(error),
+                break;
             }
-        }
-
-        unreachable!("non-empty routes return from the loop")
+        }))
     }
 }
 
