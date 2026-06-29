@@ -141,6 +141,43 @@ async fn streaming_fallback_retries_when_first_stream_fails_before_emitting_even
     assert_eq!(fallback.requested_models(), vec!["gpt-4.1"]);
 }
 
+#[tokio::test]
+async fn streaming_uses_healthy_primary_without_resolving_unused_fallback_provider() {
+    let primary = Arc::new(StreamFakeProvider::new([StreamOutcome::events([
+        Ok(ModelStreamEvent::MessageDelta("primary stream".to_owned())),
+        Ok(ModelStreamEvent::Done),
+    ])]));
+    let provider = RoutedModelProvider::new(
+        ProviderRegistry::new().with_provider("anthropic", Arc::clone(&primary)),
+        ModelCatalog::new().with_alias(
+            "movedot-max",
+            [
+                ProviderModel::new("anthropic", "claude-opus-4-20250514"),
+                ProviderModel::new("missing-provider", "unused-model"),
+            ],
+        ),
+    )
+    .with_fallback_policy(FallbackPolicy::transient_provider_errors());
+
+    let mut stream = provider
+        .stream(ModelRequest::new("movedot-max", vec![]))
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+
+    assert_eq!(
+        events,
+        vec![
+            ModelStreamEvent::MessageDelta("primary stream".to_owned()),
+            ModelStreamEvent::Done,
+        ]
+    );
+    assert_eq!(primary.requested_models(), vec!["claude-opus-4-20250514"]);
+}
+
 struct FakeProvider {
     outcomes: Mutex<VecDeque<Outcome>>,
     requests: Mutex<Vec<ModelRequest>>,
