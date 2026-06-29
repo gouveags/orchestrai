@@ -3,11 +3,13 @@ use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 use futures_util::StreamExt;
 
 use crate::{
+    capabilities::{CapabilityBundleSet, CapabilityError, CapabilitySelection},
+    provider::{CacheHint, CacheHintScope, CachePolicy, ProviderFeature},
     provider::{ModelProvider, ModelRequest, ModelResponse, ModelStreamEvent, ProviderError},
     run_state::{BeforeModelCall, ModelCallConfig, RunState, StateInstructionPolicy},
     summarization::{ConversationSummary, PreparedMessages, SummaryPolicy},
     tool::{ToolError, ToolRegistry},
-    types::{Message, ToolCall, ToolResult},
+    types::{Message, Role, ToolCall, ToolResult},
 };
 
 pub(crate) type BeforeModelCallHook = Arc<
@@ -26,12 +28,14 @@ pub(crate) struct RunStateCallOptions {
     pub before_model_call: Option<BeforeModelCallHook>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentLoopConfig {
     pub model: String,
     pub max_tool_rounds: usize,
     pub max_tokens: Option<u32>,
     pub summary_policy: Option<SummaryPolicy>,
+    pub capability_bundles: CapabilityBundleSet,
+    pub cache_policy: CachePolicy,
 }
 
 impl AgentLoopConfig {
@@ -41,6 +45,8 @@ impl AgentLoopConfig {
             max_tool_rounds: 8,
             max_tokens: None,
             summary_policy: None,
+            capability_bundles: CapabilityBundleSet::new(),
+            cache_policy: CachePolicy::disabled(),
         }
     }
 
@@ -56,6 +62,16 @@ impl AgentLoopConfig {
 
     pub fn with_summary_policy(mut self, summary_policy: SummaryPolicy) -> Self {
         self.summary_policy = Some(summary_policy);
+        self
+    }
+
+    pub fn with_capability_bundles(mut self, capability_bundles: CapabilityBundleSet) -> Self {
+        self.capability_bundles = capability_bundles;
+        self
+    }
+
+    pub fn with_cache_policy(mut self, cache_policy: CachePolicy) -> Self {
+        self.cache_policy = cache_policy;
         self
     }
 }
@@ -79,11 +95,21 @@ where
     }
 
     pub async fn run(&self, messages: Vec<Message>) -> Result<LoopOutput, LoopError> {
-        let mut messages = messages;
+        self.run_with_capabilities(messages, CapabilitySelection::default())
+            .await
+    }
+
+    pub async fn run_with_capabilities(
+        &self,
+        messages: Vec<Message>,
+        selection: CapabilitySelection,
+    ) -> Result<LoopOutput, LoopError> {
+        let context = self.run_context(&selection)?;
+        let mut messages = apply_capability_prompts(messages, &context.prompts);
         let mut all_tool_results = Vec::new();
 
         for _round in 0..=self.config.max_tool_rounds {
-            let model_call = self.call_model(messages.clone()).await?;
+            let model_call = self.call_model(messages.clone(), &context.tools).await?;
             let injected_summary = model_call.injected_summary;
             let response = model_call.response;
             messages.push(Message::assistant_with_tool_calls(
@@ -100,7 +126,9 @@ where
                 });
             }
 
-            let tool_results = self.execute_tool_calls(&response.tool_calls).await?;
+            let tool_results = self
+                .execute_tool_calls(&response.tool_calls, &context.tools)
+                .await?;
             for result in &tool_results {
                 messages.push(Message::tool(
                     result.tool_call_id.clone(),
@@ -119,13 +147,14 @@ where
         state: RunState,
         options: RunStateCallOptions,
     ) -> Result<LoopOutput, LoopError> {
-        let mut messages = messages;
+        let context = self.run_context(&CapabilitySelection::default())?;
+        let mut messages = apply_capability_prompts(messages, &context.prompts);
         let mut state = state;
         let mut all_tool_results = Vec::new();
 
         for _round in 0..=self.config.max_tool_rounds {
             let model_call = self
-                .call_model_with_state(messages.clone(), &mut state, &options)
+                .call_model_with_state(messages.clone(), &mut state, &options, &context.tools)
                 .await?;
             let injected_summary = model_call.injected_summary;
             let response = model_call.response;
@@ -143,7 +172,9 @@ where
                 });
             }
 
-            let tool_results = self.execute_tool_calls(&response.tool_calls).await?;
+            let tool_results = self
+                .execute_tool_calls(&response.tool_calls, &context.tools)
+                .await?;
             for result in &tool_results {
                 messages.push(Message::tool(
                     result.tool_call_id.clone(),
@@ -165,11 +196,12 @@ where
         F: FnMut(LoopEvent) -> Fut + Send,
         Fut: std::future::Future<Output = ()> + Send,
     {
-        let mut messages = messages;
+        let context = self.run_context(&CapabilitySelection::default())?;
+        let mut messages = apply_capability_prompts(messages, &context.prompts);
         let mut all_tool_results = Vec::new();
 
         for _round in 0..=self.config.max_tool_rounds {
-            let prepared = self.request(messages.clone());
+            let prepared = self.request(messages.clone(), &context.tools)?;
             let injected_summary = prepared.injected_summary;
             let mut stream = self
                 .provider
@@ -234,7 +266,7 @@ where
                 })
                 .await;
 
-                let result = self.execute_tool_call(call).await?;
+                let result = self.execute_tool_call(call, &context.tools).await?;
 
                 on_event(LoopEvent::ToolFinished {
                     tool_call_id: result.tool_call_id.clone(),
@@ -253,8 +285,12 @@ where
         Err(LoopError::TooManyToolRounds(self.config.max_tool_rounds))
     }
 
-    async fn call_model(&self, messages: Vec<Message>) -> Result<ModelCall, LoopError> {
-        let prepared = self.request(messages);
+    async fn call_model(
+        &self,
+        messages: Vec<Message>,
+        tools: &ToolRegistry,
+    ) -> Result<ModelCall, LoopError> {
+        let prepared = self.request(messages, tools)?;
         let response = self
             .provider
             .complete(prepared.request)
@@ -272,8 +308,11 @@ where
         messages: Vec<Message>,
         state: &mut RunState,
         options: &RunStateCallOptions,
+        tools: &ToolRegistry,
     ) -> Result<ModelCall, LoopError> {
-        let prepared = self.request_with_state(messages, state, options).await?;
+        let prepared = self
+            .request_with_state(messages, state, options, tools)
+            .await?;
         let response = self
             .provider
             .complete(prepared.request)
@@ -286,19 +325,25 @@ where
         })
     }
 
-    fn request(&self, messages: Vec<Message>) -> PreparedRequest {
+    fn request(
+        &self,
+        messages: Vec<Message>,
+        tools: &ToolRegistry,
+    ) -> Result<PreparedRequest, LoopError> {
         let prepared_messages = self.prepare_messages(messages);
-        let request = ModelRequest {
+        let mut request = ModelRequest {
             model: self.config.model.clone(),
             messages: prepared_messages.messages,
-            tools: self.tools.definitions(),
+            tools: tools.definitions(),
             max_tokens: self.config.max_tokens,
+            cache_hints: Vec::new(),
         };
+        self.apply_cache_hints(&mut request)?;
 
-        PreparedRequest {
+        Ok(PreparedRequest {
             request,
             injected_summary: prepared_messages.injected_summary,
-        }
+        })
     }
 
     async fn request_with_state(
@@ -306,6 +351,7 @@ where
         messages: Vec<Message>,
         state: &mut RunState,
         options: &RunStateCallOptions,
+        tools: &ToolRegistry,
     ) -> Result<PreparedRequest, LoopError> {
         let mut call = BeforeModelCall {
             state: state.clone(),
@@ -319,12 +365,14 @@ where
         *state = call.state;
         let prepared_messages =
             self.prepare_messages_with_state(messages, state, options.instruction_policy.as_ref());
-        let request = ModelRequest {
+        let mut request = ModelRequest {
             model: call.config.model,
             messages: prepared_messages.messages,
-            tools: self.tools.definitions(),
+            tools: tools.definitions(),
             max_tokens: call.config.max_tokens,
+            cache_hints: Vec::new(),
         };
+        self.apply_cache_hints(&mut request)?;
 
         Ok(PreparedRequest {
             request,
@@ -350,6 +398,49 @@ where
             model,
             max_tokens: self.config.max_tokens,
         })
+    }
+
+    fn run_context(&self, selection: &CapabilitySelection) -> Result<RunContext, LoopError> {
+        let resolved = self
+            .config
+            .capability_bundles
+            .resolve(selection, &self.tools)
+            .map_err(LoopError::Capability)?;
+
+        Ok(RunContext {
+            prompts: resolved.prompts,
+            tools: resolved.tools,
+        })
+    }
+
+    fn apply_cache_hints(&self, request: &mut ModelRequest) -> Result<(), LoopError> {
+        if !self.config.cache_policy.uses_provider_prompt_cache() {
+            return Ok(());
+        }
+
+        if !self.provider.supports(ProviderFeature::PromptCache) {
+            return Err(ProviderError::UnsupportedFeature(ProviderFeature::PromptCache).into());
+        }
+
+        if let Some(message_index) = request
+            .messages
+            .iter()
+            .position(|message| message.role == Role::System)
+        {
+            request.cache_hints.push(
+                CacheHint::new(CacheHintScope::SystemPrompt { message_index })
+                    .for_feature(ProviderFeature::PromptCache),
+            );
+        }
+
+        if !request.tools.is_empty() {
+            request.cache_hints.push(
+                CacheHint::new(CacheHintScope::ToolDefinitions)
+                    .for_feature(ProviderFeature::PromptCache),
+            );
+        }
+
+        Ok(())
     }
 
     fn prepare_messages(&self, messages: Vec<Message>) -> PreparedMessages {
@@ -400,18 +491,23 @@ where
     async fn execute_tool_calls(
         &self,
         tool_calls: &[ToolCall],
+        tools: &ToolRegistry,
     ) -> Result<Vec<ToolResult>, LoopError> {
         let mut results = Vec::with_capacity(tool_calls.len());
 
         for call in tool_calls {
-            results.push(self.execute_tool_call(call).await?);
+            results.push(self.execute_tool_call(call, tools).await?);
         }
 
         Ok(results)
     }
 
-    async fn execute_tool_call(&self, call: &ToolCall) -> Result<ToolResult, LoopError> {
-        match self.tools.execute(&call.name, call.arguments.clone()).await {
+    async fn execute_tool_call(
+        &self,
+        call: &ToolCall,
+        tools: &ToolRegistry,
+    ) -> Result<ToolResult, LoopError> {
+        match tools.execute(&call.name, call.arguments.clone()).await {
             Ok(content) => Ok(ToolResult::ok(call.id.clone(), call.name.clone(), content)),
             Err(ToolError::ResultContent(content)) => Ok(ToolResult::error(
                 call.id.clone(),
@@ -421,6 +517,11 @@ where
             Err(error) => Err(LoopError::Tool(error)),
         }
     }
+}
+
+struct RunContext {
+    prompts: Vec<String>,
+    tools: ToolRegistry,
 }
 
 struct PreparedRequest {
@@ -472,10 +573,28 @@ pub enum LoopError {
     Provider(#[from] ProviderError),
     #[error(transparent)]
     Tool(#[from] ToolError),
+    #[error(transparent)]
+    Capability(#[from] CapabilityError),
     #[error("model requested more than {0} tool rounds")]
     TooManyToolRounds(usize),
     #[error("streamed tool call `{0}` did not include valid JSON arguments: {1}")]
     InvalidToolArguments(String, serde_json::Error),
+}
+
+fn apply_capability_prompts(mut messages: Vec<Message>, prompts: &[String]) -> Vec<Message> {
+    if prompts.is_empty() {
+        return messages;
+    }
+
+    let prompt = prompts.join("\n\n");
+    match messages.first_mut() {
+        Some(message) if message.role == Role::System => {
+            message.content = format!("{}\n\n{prompt}", message.content);
+        }
+        _ => messages.insert(0, Message::system(prompt)),
+    }
+
+    messages
 }
 
 #[derive(Default)]

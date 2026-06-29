@@ -227,9 +227,10 @@ fn is_transient_provider_error(error: &ProviderError) -> bool {
     match error {
         ProviderError::Http(error) => error.is_timeout() || error.is_connect(),
         ProviderError::Status { status, .. } => is_transient_status(*status),
-        ProviderError::MissingField(_) | ProviderError::Parse(_) | ProviderError::Config(_) => {
-            false
-        }
+        ProviderError::MissingField(_)
+        | ProviderError::Parse(_)
+        | ProviderError::Config(_)
+        | ProviderError::UnsupportedFeature(_) => false,
     }
 }
 
