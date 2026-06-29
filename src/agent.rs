@@ -149,10 +149,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_prepends_configured_instructions_to_simple_input() {
-        let last_request = Arc::new(Mutex::new(None));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let agent = create_agent(
             AgentConfig::new(
-                FakeProvider::new(ModelResponse::text("final"), Arc::clone(&last_request)),
+                FakeProvider::new(ModelResponse::text("final"), Arc::clone(&requests)),
                 "fake-model",
             )
             .with_instructions("You are terse."),
@@ -161,8 +161,8 @@ mod tests {
         let output = agent.run("hello").await.unwrap();
 
         assert_eq!(output.final_message, "final");
-        let request = last_request.lock().unwrap();
-        let messages = &request.as_ref().unwrap().messages;
+        let request = requests.lock().unwrap();
+        let messages = &request[0].messages;
         assert_eq!(messages[0].role, Role::System);
         assert_eq!(messages[0].content, "You are terse.");
         assert_eq!(messages[1].role, Role::User);
@@ -171,6 +171,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_keeps_tools_behind_the_clean_agent_api() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let agent = create_agent(
             AgentConfig::new(
                 FakeProvider::sequence(
@@ -186,11 +187,12 @@ mod tests {
                         },
                         ModelResponse::text("8"),
                     ],
-                    Arc::new(Mutex::new(None)),
+                    Arc::clone(&requests),
                 ),
                 "fake-model",
             )
             .with_max_tool_rounds(1)
+            .with_max_tokens(64)
             .with_tool(FnTool::new(
                 ToolDefinition::new(
                     "double",
@@ -213,26 +215,31 @@ mod tests {
 
         assert_eq!(output.final_message, "8");
         assert_eq!(output.tool_results[0].content, "8");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].model, "fake-model");
+        assert_eq!(requests[0].max_tokens, Some(64));
+        assert_eq!(requests[0].tools.len(), 1);
+        assert_eq!(requests[0].tools[0].name, "double");
     }
 
     struct FakeProvider {
         responses: Mutex<Vec<ModelResponse>>,
-        last_request: Arc<Mutex<Option<ModelRequest>>>,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
     }
 
     impl FakeProvider {
-        fn new(response: ModelResponse, last_request: Arc<Mutex<Option<ModelRequest>>>) -> Self {
-            Self::sequence(vec![response], last_request)
+        fn new(response: ModelResponse, requests: Arc<Mutex<Vec<ModelRequest>>>) -> Self {
+            Self::sequence(vec![response], requests)
         }
 
         fn sequence(
             mut responses: Vec<ModelResponse>,
-            last_request: Arc<Mutex<Option<ModelRequest>>>,
+            requests: Arc<Mutex<Vec<ModelRequest>>>,
         ) -> Self {
             responses.reverse();
             Self {
                 responses: Mutex::new(responses),
-                last_request,
+                requests,
             }
         }
     }
@@ -250,7 +257,7 @@ mod tests {
     #[async_trait]
     impl ModelProvider for FakeProvider {
         async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
-            *self.last_request.lock().unwrap() = Some(request);
+            self.requests.lock().unwrap().push(request);
             Ok(self.responses.lock().unwrap().pop().unwrap())
         }
 
