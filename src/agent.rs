@@ -1,5 +1,5 @@
 use crate::{
-    loop_runner::{AgentLoop, LoopError, LoopEvent, LoopOutput},
+    loop_runner::{AgentLoop, AgentLoopConfig, LoopError, LoopEvent, LoopOutput},
     provider::ModelProvider,
     tool::{Tool, ToolRegistry},
     types::Message,
@@ -74,11 +74,11 @@ where
     P: ModelProvider,
 {
     pub fn new(config: AgentConfig<P>) -> Self {
-        let loop_config = crate::loop_runner::AgentLoopConfig {
-            model: config.model,
-            max_tool_rounds: config.max_tool_rounds,
-            max_tokens: config.max_tokens,
-        };
+        let mut loop_config =
+            AgentLoopConfig::new(config.model).with_max_tool_rounds(config.max_tool_rounds);
+        if let Some(max_tokens) = config.max_tokens {
+            loop_config = loop_config.with_max_tokens(max_tokens);
+        }
 
         Self {
             loop_runner: AgentLoop::new(config.provider, config.tools, loop_config),
