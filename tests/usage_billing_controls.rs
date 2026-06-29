@@ -4,14 +4,15 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use futures_util::stream;
 use orchestrai::{
     AgentConfig, FnTool, LoopError, Message, ModelProvider, ModelRequest, ModelResponse,
-    ModelStream, ModelStreamEvent, ProviderResult, ToolCall, ToolDefinition, ToolError, Usage,
-    UsageLimitKind, UsageLimits, UsageMeter, UsageSnapshot, create_agent,
+    ModelStream, ModelStreamEvent, ProviderError, ProviderResult, ToolCall, ToolDefinition,
+    ToolError, Usage, UsageLimitKind, UsageLimits, UsageMeter, UsageSnapshot, create_agent,
 };
 use serde_json::{Value, json};
 
@@ -260,6 +261,139 @@ async fn recoverable_tool_errors_are_counted_and_still_agent_visible() {
     assert_eq!(meter.snapshot(), output.usage_snapshot());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_model_call_limit_is_reserved_before_provider_await() {
+    let meter = UsageMeter::default();
+    let limits = UsageLimits::default().with_max_model_calls(1);
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let agent_a = create_agent(
+        AgentConfig::new(
+            SleepingProvider::new("first", Arc::clone(&provider_calls)),
+            "fake-model",
+        )
+        .with_usage_meter(meter.clone())
+        .with_usage_limits(limits),
+    );
+    let agent_b = create_agent(
+        AgentConfig::new(
+            SleepingProvider::new("second", Arc::clone(&provider_calls)),
+            "fake-model",
+        )
+        .with_usage_meter(meter.clone())
+        .with_usage_limits(limits),
+    );
+
+    let first = tokio::spawn(async move { agent_a.run("hello").await });
+    let second = tokio::spawn(async move { agent_b.run("hello").await });
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
+
+    assert_eq!(success_count([first.as_ref(), second.as_ref()]), 1);
+    assert_eq!(
+        usage_limit_error_count(
+            [first.as_ref(), second.as_ref()],
+            UsageLimitKind::ModelCalls
+        ),
+        1
+    );
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        meter.snapshot(),
+        UsageSnapshot {
+            runs: 2,
+            model_calls: 1,
+            tool_calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_tool_call_limit_is_reserved_before_tool_await() {
+    let meter = UsageMeter::default();
+    let limits = UsageLimits::default().with_max_tool_calls(1);
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    let agent_a = create_agent(
+        AgentConfig::new(
+            FakeProvider::responses(
+                vec![
+                    tool_response("call_1", "slow_tool", json!({})),
+                    text_response("done"),
+                ],
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+            "fake-model",
+        )
+        .with_usage_meter(meter.clone())
+        .with_usage_limits(limits)
+        .with_tool(slow_tool(Arc::clone(&tool_calls))),
+    );
+    let agent_b = create_agent(
+        AgentConfig::new(
+            FakeProvider::responses(
+                vec![
+                    tool_response("call_2", "slow_tool", json!({})),
+                    text_response("done"),
+                ],
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+            "fake-model",
+        )
+        .with_usage_meter(meter.clone())
+        .with_usage_limits(limits)
+        .with_tool(slow_tool(Arc::clone(&tool_calls))),
+    );
+
+    let first = tokio::spawn(async move { agent_a.run("use tool").await });
+    let second = tokio::spawn(async move { agent_b.run("use tool").await });
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
+
+    assert_eq!(success_count([first.as_ref(), second.as_ref()]), 1);
+    assert_eq!(
+        usage_limit_error_count([first.as_ref(), second.as_ref()], UsageLimitKind::ToolCalls),
+        1
+    );
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(meter.snapshot().tool_calls, 1);
+}
+
+#[tokio::test]
+async fn failed_provider_calls_still_count_as_logical_model_call_attempts() {
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let meter = UsageMeter::default();
+    let agent = create_agent(
+        AgentConfig::new(
+            FailingProvider {
+                calls: Arc::clone(&provider_calls),
+            },
+            "fake-model",
+        )
+        .with_usage_meter(meter.clone()),
+    );
+
+    let error = agent.run("hello").await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        LoopError::Provider(ProviderError::Config(message)) if message == "provider failed"
+    ));
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        meter.snapshot(),
+        UsageSnapshot {
+            runs: 1,
+            model_calls: 1,
+            tool_calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+        }
+    );
+}
+
 fn lookup_tool() -> impl orchestrai::Tool {
     FnTool::new(
         ToolDefinition::new(
@@ -313,12 +447,96 @@ fn usage(input_tokens: u64, output_tokens: u64) -> Usage {
     }
 }
 
+fn slow_tool(tool_calls: Arc<AtomicUsize>) -> impl orchestrai::Tool {
+    FnTool::new(
+        ToolDefinition::new("slow_tool", "Slow tool.", json!({})),
+        move |_arguments| {
+            let tool_calls = Arc::clone(&tool_calls);
+            Box::pin(async move {
+                std::thread::sleep(Duration::from_millis(100));
+                tool_calls.fetch_add(1, Ordering::SeqCst);
+                Ok("ok".to_owned())
+            })
+        },
+    )
+}
+
+fn success_count<'a>(
+    results: impl IntoIterator<Item = Result<&'a orchestrai::AgentOutput, &'a LoopError>>,
+) -> usize {
+    results.into_iter().filter(Result::is_ok).count()
+}
+
+fn usage_limit_error_count<'a>(
+    results: impl IntoIterator<Item = Result<&'a orchestrai::AgentOutput, &'a LoopError>>,
+    kind: UsageLimitKind,
+) -> usize {
+    results
+        .into_iter()
+        .filter(|result| {
+            matches!(
+                result,
+                Err(LoopError::UsageLimitExceeded {
+                    kind: error_kind,
+                    ..
+                }) if *error_kind == kind
+            )
+        })
+        .count()
+}
+
 struct FakeProvider {
     responses: Mutex<VecDeque<ModelResponse>>,
     streams: Mutex<VecDeque<Vec<ModelStreamEvent>>>,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
     complete_calls: AtomicUsize,
     stream_calls: AtomicUsize,
+}
+
+struct SleepingProvider {
+    message: String,
+    calls: Arc<AtomicUsize>,
+}
+
+impl SleepingProvider {
+    fn new(message: impl Into<String>, calls: Arc<AtomicUsize>) -> Self {
+        Self {
+            message: message.into(),
+            calls,
+        }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for SleepingProvider {
+    async fn complete(&self, _request: ModelRequest) -> ProviderResult<ModelResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        Ok(text_response(&self.message))
+    }
+
+    async fn stream(&self, _request: ModelRequest) -> ProviderResult<ModelStream> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        Ok(Box::pin(stream::iter(vec![Ok(ModelStreamEvent::Done)])))
+    }
+}
+
+struct FailingProvider {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ModelProvider for FailingProvider {
+    async fn complete(&self, _request: ModelRequest) -> ProviderResult<ModelResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(ProviderError::Config("provider failed".to_owned()))
+    }
+
+    async fn stream(&self, _request: ModelRequest) -> ProviderResult<ModelStream> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(ProviderError::Config("provider failed".to_owned()))
+    }
 }
 
 impl FakeProvider {

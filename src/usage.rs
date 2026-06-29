@@ -5,6 +5,9 @@ use crate::types::Usage;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UsageSnapshot {
     pub runs: u64,
+    /// Logical orchestrai model requests made by the loop. One call is one
+    /// `ModelProvider::complete` or `ModelProvider::stream` invocation, not a
+    /// provider adapter's internal retry or fallback attempt.
     pub model_calls: u64,
     pub tool_calls: u64,
     pub input_tokens: u64,
@@ -56,34 +59,40 @@ impl UsageMeter {
         Ok(delta)
     }
 
-    pub(crate) fn ensure_model_call_allowed(
+    pub(crate) fn reserve_model_call(
         &self,
         limits: &UsageLimits,
-    ) -> Result<(), UsageLimitError> {
-        limits.check_model_call_start(self.snapshot())
-    }
+    ) -> Result<UsageSnapshot, UsageLimitError> {
+        let mut snapshot = self.inner.lock().unwrap();
+        limits.check_model_call_start(*snapshot)?;
 
-    pub(crate) fn ensure_tool_call_allowed(
-        &self,
-        limits: &UsageLimits,
-    ) -> Result<(), UsageLimitError> {
-        limits.check_tool_call_start(self.snapshot())
-    }
-
-    pub(crate) fn record_model_call(&self, usage: Option<&Usage>) -> UsageSnapshot {
         let delta = UsageSnapshot {
             model_calls: 1,
-            input_tokens: usage.and_then(|usage| usage.input_tokens).unwrap_or(0),
-            output_tokens: usage.and_then(|usage| usage.output_tokens).unwrap_or(0),
             ..UsageSnapshot::default()
         };
-        self.record(delta);
-        delta
+        snapshot.add_assign(delta);
+        Ok(delta)
     }
 
-    pub(crate) fn record_tool_call(&self) -> UsageSnapshot {
+    pub(crate) fn reserve_tool_call(
+        &self,
+        limits: &UsageLimits,
+    ) -> Result<UsageSnapshot, UsageLimitError> {
+        let mut snapshot = self.inner.lock().unwrap();
+        limits.check_tool_call_start(*snapshot)?;
+
         let delta = UsageSnapshot {
             tool_calls: 1,
+            ..UsageSnapshot::default()
+        };
+        snapshot.add_assign(delta);
+        Ok(delta)
+    }
+
+    pub(crate) fn record_model_usage(&self, usage: Option<&Usage>) -> UsageSnapshot {
+        let delta = UsageSnapshot {
+            input_tokens: usage.and_then(|usage| usage.input_tokens).unwrap_or(0),
+            output_tokens: usage.and_then(|usage| usage.output_tokens).unwrap_or(0),
             ..UsageSnapshot::default()
         };
         self.record(delta);

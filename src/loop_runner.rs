@@ -284,7 +284,8 @@ where
             let prepared = self.request(messages.clone(), &context.tools)?;
             let injected_summary = prepared.injected_summary;
             let model = prepared.request.model.clone();
-            self.ensure_model_call_allowed()?;
+            let delta = self.reserve_model_call()?;
+            usage_snapshot.add_assign(delta);
             self.record_telemetry(TelemetryEvent::ModelCallStarted {
                 model: model.clone(),
             });
@@ -386,7 +387,8 @@ where
         usage_snapshot: &mut UsageSnapshot,
     ) -> Result<ModelCall, LoopError> {
         let prepared = self.request(messages, tools)?;
-        self.ensure_model_call_allowed()?;
+        let delta = self.reserve_model_call()?;
+        usage_snapshot.add_assign(delta);
         let model = prepared.request.model.clone();
         self.record_telemetry(TelemetryEvent::ModelCallStarted {
             model: model.clone(),
@@ -420,7 +422,8 @@ where
         let prepared = self
             .request_with_state(messages, state, options, tools)
             .await?;
-        self.ensure_model_call_allowed()?;
+        let delta = self.reserve_model_call()?;
+        usage_snapshot.add_assign(delta);
         let model = prepared.request.model.clone();
         self.record_telemetry(TelemetryEvent::ModelCallStarted {
             model: model.clone(),
@@ -627,7 +630,8 @@ where
         tools: &ToolRegistry,
         usage_snapshot: &mut UsageSnapshot,
     ) -> Result<ToolResult, LoopError> {
-        self.ensure_tool_call_allowed()?;
+        let delta = self.reserve_tool_call()?;
+        usage_snapshot.add_assign(delta);
         self.record_telemetry(TelemetryEvent::ToolCallStarted {
             tool_call_id: call.id.clone(),
             name: call.name.clone(),
@@ -635,8 +639,6 @@ where
 
         match tools.execute(&call.name, call.arguments.clone()).await {
             Ok(content) => {
-                let delta = self.config.usage_meter.record_tool_call();
-                usage_snapshot.add_assign(delta);
                 self.record_telemetry(TelemetryEvent::ToolCallFinished {
                     tool_call_id: call.id.clone(),
                     name: call.name.clone(),
@@ -646,8 +648,6 @@ where
                 Ok(ToolResult::ok(call.id.clone(), call.name.clone(), content))
             }
             Err(ToolError::ResultContent(content)) => {
-                let delta = self.config.usage_meter.record_tool_call();
-                usage_snapshot.add_assign(delta);
                 self.record_telemetry(TelemetryEvent::ToolCallFinished {
                     tool_call_id: call.id.clone(),
                     name: call.name.clone(),
@@ -661,8 +661,6 @@ where
                 ))
             }
             Err(error) => {
-                let delta = self.config.usage_meter.record_tool_call();
-                usage_snapshot.add_assign(delta);
                 self.record_telemetry(TelemetryEvent::ToolCallFinished {
                     tool_call_id: call.id.clone(),
                     name: call.name.clone(),
@@ -687,24 +685,24 @@ where
         self.record_telemetry(TelemetryEvent::RunFinished { success });
     }
 
-    fn ensure_model_call_allowed(&self) -> Result<(), LoopError> {
+    fn reserve_model_call(&self) -> Result<UsageSnapshot, LoopError> {
         self.config
             .usage_meter
-            .ensure_model_call_allowed(&self.config.usage_limits)
+            .reserve_model_call(&self.config.usage_limits)
             .map_err(LoopError::from)
     }
 
-    fn ensure_tool_call_allowed(&self) -> Result<(), LoopError> {
+    fn reserve_tool_call(&self) -> Result<UsageSnapshot, LoopError> {
         self.config
             .usage_meter
-            .ensure_tool_call_allowed(&self.config.usage_limits)
+            .reserve_tool_call(&self.config.usage_limits)
             .map_err(LoopError::from)
     }
 
     fn record_model_usage(&self, response: &ModelResponse) -> UsageSnapshot {
         self.config
             .usage_meter
-            .record_model_call(response.usage.as_ref())
+            .record_model_usage(response.usage.as_ref())
     }
 
     fn record_telemetry(&self, event: TelemetryEvent) {
