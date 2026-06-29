@@ -186,6 +186,7 @@ impl FileEnvironment for LocalEnvironment {
         let start = self.resolve_existing(root_path)?;
         let limit = max_results.clamp(1, 200);
         let mut matches = Vec::new();
+        let mut files = Vec::new();
         let mut stack = vec![start];
         let mut truncated = false;
 
@@ -217,35 +218,34 @@ impl FileEnvironment for LocalEnvironment {
                     continue;
                 }
 
-                if !file_type.is_file() {
-                    continue;
+                if file_type.is_file() {
+                    files.push(entry.path());
                 }
+            }
+        }
 
-                let Ok(content) = fs::read_to_string(entry.path()) else {
-                    continue;
-                };
+        files.sort_by_key(|path| self.relative_path(path));
 
-                for (line_index, line) in content.lines().enumerate() {
-                    if line.contains(query) {
-                        matches.push(SearchMatch {
-                            path: self.relative_path(&entry.path()),
-                            line: line_index + 1,
-                            text: line.to_owned(),
-                        });
-                        if matches.len() == limit {
-                            truncated = true;
-                            return Ok(SearchOutput { matches, truncated });
-                        }
+        for file in files {
+            let Ok(content) = fs::read_to_string(&file) else {
+                continue;
+            };
+
+            for (line_index, line) in content.lines().enumerate() {
+                if line.contains(query) {
+                    matches.push(SearchMatch {
+                        path: self.relative_path(&file),
+                        line: line_index + 1,
+                        text: line.to_owned(),
+                    });
+                    if matches.len() == limit {
+                        truncated = true;
+                        return Ok(SearchOutput { matches, truncated });
                     }
                 }
             }
         }
 
-        matches.sort_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| left.line.cmp(&right.line))
-        });
         Ok(SearchOutput { matches, truncated })
     }
 }
@@ -364,37 +364,89 @@ mod tests {
     }
 
     #[test]
-    fn local_environment_searches_text_without_following_missing_files() {
+    fn local_environment_searches_text_with_stable_agent_visible_output() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("src")).unwrap();
-        fs::write(temp.path().join("src/lib.rs"), "alpha\nbeta alpha\n").unwrap();
-        fs::write(temp.path().join("README.md"), "alpha docs\n").unwrap();
+        fs::write(temp.path().join("README.md"), "alpha docs\nno match\n").unwrap();
+        fs::write(
+            temp.path().join("src/lib.rs"),
+            "alpha one\nbeta\nalpha two\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("src/main.rs"),
+            "fn main() {}\nalpha three\n",
+        )
+        .unwrap();
         let environment = LocalEnvironment::new(temp.path()).unwrap();
 
-        let output = environment.search_text("alpha", None, 2).unwrap();
+        let output = environment.search_text("alpha", None, 3).unwrap();
 
-        assert_eq!(output.matches.len(), 2);
-        assert!(output.truncated);
-        assert!(output.matches.iter().any(|found| found.path == "README.md"));
+        assert_eq!(
+            output,
+            SearchOutput {
+                matches: vec![
+                    SearchMatch {
+                        path: "README.md".to_owned(),
+                        line: 1,
+                        text: "alpha docs".to_owned(),
+                    },
+                    SearchMatch {
+                        path: "src/lib.rs".to_owned(),
+                        line: 1,
+                        text: "alpha one".to_owned(),
+                    },
+                    SearchMatch {
+                        path: "src/lib.rs".to_owned(),
+                        line: 3,
+                        text: "alpha two".to_owned(),
+                    },
+                ],
+                truncated: true,
+            }
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn local_environment_rejects_symlinks_that_escape_root() {
+    fn local_environment_rejects_symlink_escape_across_resolvers() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("secret.txt"), "nope").unwrap();
+        fs::create_dir(outside.path().join("secret-dir")).unwrap();
+        fs::write(outside.path().join("secret-dir/hidden.txt"), "hidden").unwrap();
         symlink(
             outside.path().join("secret.txt"),
             temp.path().join("secret-link"),
+        )
+        .unwrap();
+        symlink(
+            outside.path().join("secret-dir"),
+            temp.path().join("secret-dir-link"),
         )
         .unwrap();
         let environment = LocalEnvironment::new(temp.path()).unwrap();
 
         assert!(matches!(
             environment.read_text("secret-link"),
+            Err(EnvironmentError::OutsideRoot(_))
+        ));
+        assert!(matches!(
+            environment.write_text("secret-link", "nope"),
+            Err(EnvironmentError::OutsideRoot(_))
+        ));
+        assert!(matches!(
+            environment.write_text("secret-dir-link/new.txt", "nope"),
+            Err(EnvironmentError::OutsideRoot(_))
+        ));
+        assert!(matches!(
+            environment.list("secret-dir-link"),
+            Err(EnvironmentError::OutsideRoot(_))
+        ));
+        assert!(matches!(
+            environment.search_text("hidden", Some("secret-dir-link"), 10),
             Err(EnvironmentError::OutsideRoot(_))
         ));
     }

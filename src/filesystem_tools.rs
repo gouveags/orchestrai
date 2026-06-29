@@ -224,7 +224,7 @@ fn tool_error_from_environment(error: EnvironmentError) -> ToolError {
 mod tests {
     use std::{fs, sync::Arc};
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::{environment::LocalEnvironment, tool::ToolRegistry};
@@ -244,25 +244,46 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(write, r#"{"path":"notes/todo.txt","bytes_written":10}"#);
+        assert_eq!(
+            serde_json::from_str::<Value>(&write).unwrap(),
+            json!({"path": "notes/todo.txt", "bytes_written": 10})
+        );
 
         let read = registry
             .execute(READ_FILE_TOOL, json!({"path": "notes/todo.txt"}))
             .await
             .unwrap();
-        assert_eq!(read, r#"{"content":"alpha\nbeta","path":"notes/todo.txt"}"#);
+        assert_eq!(
+            serde_json::from_str::<Value>(&read).unwrap(),
+            json!({"path": "notes/todo.txt", "content": "alpha\nbeta"})
+        );
 
         let list = registry
             .execute(LIST_FILES_TOOL, json!({"path": "notes"}))
             .await
             .unwrap();
-        assert!(list.contains(r#""path":"notes/todo.txt""#));
+        assert_eq!(
+            serde_json::from_str::<Value>(&list).unwrap(),
+            json!({
+                "entries": [
+                    {"path": "notes/todo.txt", "kind": "file"}
+                ]
+            })
+        );
 
         let search = registry
             .execute(SEARCH_FILES_TOOL, json!({"query": "beta"}))
             .await
             .unwrap();
-        assert!(search.contains(r#""text":"beta""#));
+        assert_eq!(
+            serde_json::from_str::<Value>(&search).unwrap(),
+            json!({
+                "matches": [
+                    {"path": "notes/todo.txt", "line": 2, "text": "beta"}
+                ],
+                "truncated": false
+            })
+        );
     }
 
     #[tokio::test]
