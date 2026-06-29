@@ -4,7 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use orchestrai::{
     AgentConfig, FallbackPolicy, ModelCatalog, ModelProvider, ModelRequest, ModelResponse,
     ModelStream, ProviderModel, ProviderRegistry, RoutedModelProvider, create_agent,
@@ -98,6 +98,49 @@ async fn hard_provider_errors_surface_without_trying_fallback_models() {
     assert!(fallback.requested_models().is_empty());
 }
 
+#[tokio::test]
+async fn streaming_fallback_retries_when_first_stream_fails_before_emitting_events() {
+    let primary = Arc::new(StreamFakeProvider::new([StreamOutcome::events([Err(
+        transient_status_error(),
+    )])]));
+    let fallback = Arc::new(StreamFakeProvider::new([StreamOutcome::events([
+        Ok(ModelStreamEvent::MessageDelta("fallback stream".to_owned())),
+        Ok(ModelStreamEvent::Done),
+    ])]));
+    let provider = RoutedModelProvider::new(
+        ProviderRegistry::new()
+            .with_provider("anthropic", Arc::clone(&primary))
+            .with_provider("openai", Arc::clone(&fallback)),
+        ModelCatalog::new().with_alias(
+            "team-max",
+            [
+                ProviderModel::new("anthropic", "claude-opus-4-20250514"),
+                ProviderModel::new("openai", "gpt-4.1"),
+            ],
+        ),
+    )
+    .with_fallback_policy(FallbackPolicy::transient_provider_errors());
+
+    let mut stream = provider
+        .stream(ModelRequest::new("team-max", vec![]))
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+
+    assert_eq!(
+        events,
+        vec![
+            ModelStreamEvent::MessageDelta("fallback stream".to_owned()),
+            ModelStreamEvent::Done,
+        ]
+    );
+    assert_eq!(primary.requested_models(), vec!["claude-opus-4-20250514"]);
+    assert_eq!(fallback.requested_models(), vec!["gpt-4.1"]);
+}
+
 struct FakeProvider {
     outcomes: Mutex<VecDeque<Outcome>>,
     requests: Mutex<Vec<ModelRequest>>,
@@ -138,7 +181,7 @@ impl Outcome {
 
     fn transient_failure() -> Self {
         Self {
-            result: Err(FakeFailure::Transient),
+            result: Err(FakeFailure::TransientStatus),
         }
     }
 
@@ -150,22 +193,79 @@ impl Outcome {
 }
 
 enum FakeFailure {
-    Transient,
+    TransientStatus,
     Hard,
 }
 
 impl FakeFailure {
     fn into_provider_error(self) -> ProviderError {
         match self {
-            Self::Transient => ProviderError::Status {
-                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                body: "temporary outage".to_owned(),
-            },
+            Self::TransientStatus => transient_status_error(),
             Self::Hard => ProviderError::Status {
                 status: reqwest::StatusCode::UNAUTHORIZED,
                 body: "bad api key".to_owned(),
             },
         }
+    }
+}
+
+struct StreamFakeProvider {
+    outcomes: Mutex<VecDeque<StreamOutcome>>,
+    requests: Mutex<Vec<ModelRequest>>,
+}
+
+impl StreamFakeProvider {
+    fn new(outcomes: impl IntoIterator<Item = StreamOutcome>) -> Self {
+        Self {
+            outcomes: Mutex::new(outcomes.into_iter().collect()),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requested_models(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.model.clone())
+            .collect()
+    }
+}
+
+struct StreamOutcome {
+    events: Vec<ProviderResult<ModelStreamEvent>>,
+}
+
+impl StreamOutcome {
+    fn events(events: impl IntoIterator<Item = ProviderResult<ModelStreamEvent>>) -> Self {
+        Self {
+            events: events.into_iter().collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for StreamFakeProvider {
+    async fn complete(&self, _request: ModelRequest) -> ProviderResult<ModelResponse> {
+        unreachable!("stream fake provider only supports streaming tests")
+    }
+
+    async fn stream(&self, request: ModelRequest) -> ProviderResult<ModelStream> {
+        self.requests.lock().unwrap().push(request);
+        let outcome = self
+            .outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("fake provider received unexpected stream request");
+        Ok(Box::pin(stream::iter(outcome.events)))
+    }
+}
+
+fn transient_status_error() -> ProviderError {
+    ProviderError::Status {
+        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        body: "temporary outage".to_owned(),
     }
 }
 
