@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::types::ToolDefinition;
 
 pub type ToolResult<T> = Result<T, ToolError>;
-type BoxToolFuture = Pin<Box<dyn Future<Output = ToolResult<String>> + Send>>;
+pub(crate) type BoxToolFuture = Pin<Box<dyn Future<Output = ToolResult<String>> + Send>>;
 
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -84,6 +84,14 @@ impl ToolRegistry {
 pub enum ToolError {
     #[error("tool `{0}` was not registered")]
     NotFound(String),
+    #[error("tool returned error content: {0}")]
+    ResultContent(String),
     #[error("tool execution failed: {0}")]
     Execution(String),
+}
+
+impl ToolError {
+    pub fn result_content(content: impl Into<String>) -> Self {
+        Self::ResultContent(content.into())
+    }
 }
