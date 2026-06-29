@@ -12,7 +12,7 @@ use crate::{
     types::{Message, ToolDefinition},
 };
 
-pub const DEFAULT_SUB_AGENT_TOOL_NAME: &str = "agent.run";
+pub const DEFAULT_SUB_AGENT_TOOL_NAME: &str = "agent_run";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubAgentMountPermissions {
@@ -136,10 +136,11 @@ impl Tool for DefaultSubAgentTool {
             .runtime_mountable()
             .map(|definition| definition.id().to_owned())
             .collect::<Vec<_>>();
+        let description = self.tool_description();
 
         ToolDefinition::new(
             DEFAULT_SUB_AGENT_TOOL_NAME,
-            "Run one of the runtime-mountable sub-agents with a scoped input and optional state.",
+            description,
             json!({
                 "type": "object",
                 "properties": {
@@ -174,9 +175,17 @@ impl Tool for DefaultSubAgentTool {
             )));
         }
 
+        let state = call.state.unwrap_or_else(|| json!({}));
+        if !state.is_object() {
+            return Err(ToolError::Execution(format!(
+                "sub-agent `{}` state must be an object",
+                call.agent
+            )));
+        }
+
         let output = definition
             .runner
-            .run(call.input, call.state.unwrap_or_else(|| json!({})))
+            .run(call.input, state)
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))?;
 
@@ -186,6 +195,35 @@ impl Tool for DefaultSubAgentTool {
             "tool_results": output.tool_results,
         }))
         .map_err(|error| ToolError::Execution(format!("serialize sub-agent output: {error}")))
+    }
+}
+
+impl DefaultSubAgentTool {
+    fn tool_description(&self) -> String {
+        let agents = self
+            .registry
+            .runtime_mountable()
+            .map(|definition| {
+                if definition.capabilities().is_empty() {
+                    definition.id().to_owned()
+                } else {
+                    format!(
+                        "{} ({})",
+                        definition.id(),
+                        definition.capabilities().join(", ")
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if agents.is_empty() {
+            "Run one of the runtime-mountable sub-agents with a scoped input and optional object state.".to_owned()
+        } else {
+            format!(
+                "Run one of the runtime-mountable sub-agents with a scoped input and optional object state. Available agents: {}.",
+                agents.join("; ")
+            )
+        }
     }
 }
 
