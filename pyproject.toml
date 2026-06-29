@@ -12,5 +12,5 @@ license = { file = "LICENSE" }
 
 [tool.maturin]
 bindings = "pyo3"
-features = ["python"]
+features = ["python-extension"]
 module-name = "orchestrai"

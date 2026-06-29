@@ -9,7 +9,8 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = []
-python = ["dep:pyo3", "pyo3/extension-module"]
+python = ["dep:pyo3"]
+python-extension = ["python", "pyo3/extension-module"]
 
 [dependencies]
 async-stream = "0.3"
