@@ -485,6 +485,7 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests[0].messages.len(), 2);
+        assert_eq!(requests[0].messages[0].role, Role::System);
         assert!(
             requests[0].messages[0]
                 .content
@@ -504,22 +505,26 @@ mod tests {
 
     #[tokio::test]
     async fn run_returns_recoverable_tool_errors_as_agent_visible_tool_results() {
-        let provider = FakeProvider::with_responses(vec![
-            ModelResponse {
-                message: String::new(),
-                tool_calls: vec![ToolCall {
-                    id: "call_1".to_owned(),
-                    name: "read_cache".to_owned(),
-                    arguments: json!({}),
-                }],
-                usage: None,
-            },
-            ModelResponse {
-                message: "I can recover from that tool error.".to_owned(),
-                tool_calls: Vec::new(),
-                usage: None,
-            },
-        ]);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = FakeProvider::with_responses_and_recorder(
+            vec![
+                ModelResponse {
+                    message: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_owned(),
+                        name: "read_cache".to_owned(),
+                        arguments: json!({}),
+                    }],
+                    usage: None,
+                },
+                ModelResponse {
+                    message: "I can recover from that tool error.".to_owned(),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+            ],
+            Arc::clone(&requests),
+        );
         let mut tools = ToolRegistry::new();
         tools.register(FnTool::new(
             ToolDefinition::new("read_cache", "Read cached content.", json!({})),
@@ -540,8 +545,15 @@ mod tests {
 
         assert_eq!(output.final_message, "I can recover from that tool error.");
         assert!(output.tool_results[0].is_error);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].messages[2].role, Role::Tool);
         assert_eq!(
-            output.messages[2].content,
+            requests[1].messages[2].tool_call_id,
+            Some("call_1".to_owned())
+        );
+        assert_eq!(
+            requests[1].messages[2].content,
             r#"{"error":"cache entry was not found"}"#
         );
     }
