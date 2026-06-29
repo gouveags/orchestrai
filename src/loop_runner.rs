@@ -2,6 +2,7 @@ use futures_util::StreamExt;
 
 use crate::{
     provider::{ModelProvider, ModelRequest, ModelResponse, ModelStreamEvent, ProviderError},
+    summarization::{ConversationSummary, PreparedMessages, SummaryPolicy},
     tool::{ToolError, ToolRegistry},
     types::{Message, ToolCall, ToolResult},
 };
@@ -11,6 +12,7 @@ pub struct AgentLoopConfig {
     pub model: String,
     pub max_tool_rounds: usize,
     pub max_tokens: Option<u32>,
+    pub summary_policy: Option<SummaryPolicy>,
 }
 
 impl AgentLoopConfig {
@@ -19,7 +21,13 @@ impl AgentLoopConfig {
             model: model.into(),
             max_tool_rounds: 8,
             max_tokens: None,
+            summary_policy: None,
         }
+    }
+
+    pub fn with_summary_policy(mut self, summary_policy: SummaryPolicy) -> Self {
+        self.summary_policy = Some(summary_policy);
+        self
     }
 }
 
@@ -46,7 +54,9 @@ where
         let mut all_tool_results = Vec::new();
 
         for _round in 0..=self.config.max_tool_rounds {
-            let response = self.call_model(messages.clone()).await?;
+            let model_call = self.call_model(messages.clone()).await?;
+            let injected_summary = model_call.injected_summary;
+            let response = model_call.response;
             messages.push(Message::assistant_with_tool_calls(
                 response.message.clone(),
                 response.tool_calls.clone(),
@@ -57,6 +67,7 @@ where
                     final_message: response.message,
                     messages,
                     tool_results: all_tool_results,
+                    injected_summary,
                 });
             }
 
@@ -86,9 +97,11 @@ where
         let mut all_tool_results = Vec::new();
 
         for _round in 0..=self.config.max_tool_rounds {
+            let prepared = self.request(messages.clone());
+            let injected_summary = prepared.injected_summary;
             let mut stream = self
                 .provider
-                .stream(self.request(messages.clone()))
+                .stream(prepared.request)
                 .await
                 .map_err(LoopError::Provider)?;
             let mut aggregation = StreamAggregation::default();
@@ -138,6 +151,7 @@ where
                     final_message: response.message,
                     messages,
                     tool_results: all_tool_results,
+                    injected_summary,
                 });
             }
 
@@ -165,19 +179,43 @@ where
         Err(LoopError::TooManyToolRounds(self.config.max_tool_rounds))
     }
 
-    async fn call_model(&self, messages: Vec<Message>) -> Result<ModelResponse, LoopError> {
-        self.provider
-            .complete(self.request(messages))
+    async fn call_model(&self, messages: Vec<Message>) -> Result<ModelCall, LoopError> {
+        let prepared = self.request(messages);
+        let response = self
+            .provider
+            .complete(prepared.request)
             .await
-            .map_err(LoopError::Provider)
+            .map_err(LoopError::Provider)?;
+
+        Ok(ModelCall {
+            response,
+            injected_summary: prepared.injected_summary,
+        })
     }
 
-    fn request(&self, messages: Vec<Message>) -> ModelRequest {
-        ModelRequest {
+    fn request(&self, messages: Vec<Message>) -> PreparedRequest {
+        let prepared_messages = self.prepare_messages(messages);
+        let request = ModelRequest {
             model: self.config.model.clone(),
-            messages,
+            messages: prepared_messages.messages,
             tools: self.tools.definitions(),
             max_tokens: self.config.max_tokens,
+        };
+
+        PreparedRequest {
+            request,
+            injected_summary: prepared_messages.injected_summary,
+        }
+    }
+
+    fn prepare_messages(&self, messages: Vec<Message>) -> PreparedMessages {
+        if let Some(policy) = &self.config.summary_policy {
+            return policy.prepare(&messages);
+        }
+
+        PreparedMessages {
+            messages,
+            injected_summary: None,
         }
     }
 
@@ -188,20 +226,30 @@ where
         let mut results = Vec::with_capacity(tool_calls.len());
 
         for call in tool_calls {
-            let content = self
-                .tools
-                .execute(&call.name, call.arguments.clone())
-                .await
-                .map_err(LoopError::Tool)?;
-            results.push(ToolResult {
-                tool_call_id: call.id.clone(),
-                name: call.name.clone(),
-                content,
-            });
+            match self.tools.execute(&call.name, call.arguments.clone()).await {
+                Ok(content) => {
+                    results.push(ToolResult::ok(call.id.clone(), call.name.clone(), content))
+                }
+                Err(error) => results.push(ToolResult::error(
+                    call.id.clone(),
+                    call.name.clone(),
+                    error.to_string(),
+                )),
+            }
         }
 
         Ok(results)
     }
+}
+
+struct PreparedRequest {
+    request: ModelRequest,
+    injected_summary: Option<ConversationSummary>,
+}
+
+struct ModelCall {
+    response: ModelResponse,
+    injected_summary: Option<ConversationSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +257,7 @@ pub struct LoopOutput {
     pub final_message: String,
     pub messages: Vec<Message>,
     pub tool_results: Vec<ToolResult>,
+    pub injected_summary: Option<ConversationSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -328,6 +377,7 @@ mod tests {
     use super::*;
     use crate::{
         provider::{ModelStream, ProviderResult},
+        summarization::{ConversationSummary, SummaryPolicy},
         tool::FnTool,
         types::{Role, ToolDefinition},
     };
@@ -413,6 +463,75 @@ mod tests {
         assert!(events.lock().unwrap().contains(&LoopEvent::Done));
     }
 
+    #[tokio::test]
+    async fn run_injects_summary_context_without_rewriting_the_transcript() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = FakeProvider::with_responses_and_recorder(
+            vec![ModelResponse {
+                message: "Still on Rust.".to_owned(),
+                tool_calls: Vec::new(),
+                usage: None,
+            }],
+            Arc::clone(&requests),
+        );
+        let config = AgentLoopConfig::new("fake").with_summary_policy(SummaryPolicy::always(
+            ConversationSummary::new("The user chose Rust and dislikes hidden state."),
+        ));
+        let loop_runner = AgentLoop::new(provider, ToolRegistry::new(), config);
+        let original_messages = vec![Message::user("What did we decide?")];
+
+        let output = loop_runner.run(original_messages.clone()).await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].messages.len(), 2);
+        assert!(
+            requests[0].messages[0]
+                .content
+                .contains("The user chose Rust")
+        );
+        assert_eq!(requests[0].messages[1..], original_messages);
+        assert_eq!(output.messages.len(), 2);
+        assert_eq!(output.messages[0], Message::user("What did we decide?"));
+        assert_eq!(output.messages[1], Message::assistant("Still on Rust."));
+        assert_eq!(
+            output.injected_summary,
+            Some(ConversationSummary::new(
+                "The user chose Rust and dislikes hidden state."
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn run_returns_tool_failures_as_agent_visible_tool_results() {
+        let provider = FakeProvider::with_responses(vec![
+            ModelResponse {
+                message: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_owned(),
+                    name: "missing_tool".to_owned(),
+                    arguments: json!({}),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                message: "I can recover from that tool error.".to_owned(),
+                tool_calls: Vec::new(),
+                usage: None,
+            },
+        ]);
+        let loop_runner =
+            AgentLoop::new(provider, ToolRegistry::new(), AgentLoopConfig::new("fake"));
+
+        let output = loop_runner
+            .run(vec![Message::user("try it")])
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_message, "I can recover from that tool error.");
+        assert!(output.tool_results[0].is_error);
+        assert!(output.messages[2].content.contains("was not registered"));
+    }
+
     fn math_tools() -> ToolRegistry {
         let mut tools = ToolRegistry::new();
         tools.register(FnTool::new(
@@ -442,6 +561,7 @@ mod tests {
     struct FakeProvider {
         responses: Mutex<VecDeque<ModelResponse>>,
         streams: Mutex<VecDeque<Vec<ModelStreamEvent>>>,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
     }
 
     impl FakeProvider {
@@ -449,6 +569,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses.into()),
                 streams: Mutex::new(VecDeque::new()),
+                requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -456,17 +577,31 @@ mod tests {
             Self {
                 responses: Mutex::new(VecDeque::new()),
                 streams: Mutex::new(streams.into()),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn with_responses_and_recorder(
+            responses: Vec<ModelResponse>,
+            requests: Arc<Mutex<Vec<ModelRequest>>>,
+        ) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                streams: Mutex::new(VecDeque::new()),
+                requests,
             }
         }
     }
 
     #[async_trait]
     impl ModelProvider for FakeProvider {
-        async fn complete(&self, _request: ModelRequest) -> ProviderResult<ModelResponse> {
+        async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
+            self.requests.lock().unwrap().push(request);
             Ok(self.responses.lock().unwrap().pop_front().unwrap())
         }
 
-        async fn stream(&self, _request: ModelRequest) -> ProviderResult<ModelStream> {
+        async fn stream(&self, request: ModelRequest) -> ProviderResult<ModelStream> {
+            self.requests.lock().unwrap().push(request);
             let events = self.streams.lock().unwrap().pop_front().unwrap();
             Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
         }
