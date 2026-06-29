@@ -7,6 +7,7 @@ pub mod planning;
 pub mod provider;
 pub mod providers;
 pub mod run_state;
+pub mod subagents;
 pub mod summarization;
 pub mod tool;
 pub mod types;
@@ -31,6 +32,7 @@ pub use provider::{ModelProvider, ModelRequest, ModelResponse, ModelStream};
 pub use run_state::{
     BeforeModelCall, ModelCallConfig, RunOptions, RunState, RunStateError, StateInstructionPolicy,
 };
+pub use subagents::DefaultSubAgentTool;
 pub use summarization::{ConversationSummary, PreparedMessages, SummaryPolicy};
 pub use tool::{FnTool, Tool, ToolError, ToolRegistry};
 pub use types::{ContentBlock, Message, Role, ToolCall, ToolDefinition, ToolResult, Usage};
