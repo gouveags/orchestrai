@@ -188,11 +188,11 @@ where
         let mut results = Vec::with_capacity(tool_calls.len());
 
         for call in tool_calls {
-            let content = self
-                .tools
-                .execute(&call.name, call.arguments.clone())
-                .await
-                .map_err(LoopError::Tool)?;
+            let content = match self.tools.execute(&call.name, call.arguments.clone()).await {
+                Ok(content) => content,
+                Err(ToolError::ResultContent(content)) => content,
+                Err(error) => return Err(LoopError::Tool(error)),
+            };
             results.push(ToolResult {
                 tool_call_id: call.id.clone(),
                 name: call.name.clone(),
@@ -328,7 +328,7 @@ mod tests {
     use super::*;
     use crate::{
         provider::{ModelStream, ProviderResult},
-        tool::FnTool,
+        tool::{FnTool, ToolError},
         types::{Role, ToolDefinition},
     };
 
@@ -437,6 +437,53 @@ mod tests {
             },
         ));
         tools
+    }
+
+    #[tokio::test]
+    async fn run_returns_recoverable_tool_errors_as_tool_result_messages() {
+        let provider = FakeProvider::with_responses(vec![
+            ModelResponse {
+                message: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_owned(),
+                    name: "missing_file".to_owned(),
+                    arguments: json!({}),
+                }],
+                usage: None,
+            },
+            ModelResponse {
+                message: "I could not read it.".to_owned(),
+                tool_calls: Vec::new(),
+                usage: None,
+            },
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(FnTool::new(
+            ToolDefinition::new("missing_file", "Fails recoverably.", json!({})),
+            |_arguments| {
+                Box::pin(async {
+                    Err(ToolError::result_content(
+                        r#"{"error":"file was not found"}"#,
+                    ))
+                })
+            },
+        ));
+        let loop_runner = AgentLoop::new(provider, tools, AgentLoopConfig::new("fake"));
+
+        let output = loop_runner
+            .run(vec![Message::user("read it")])
+            .await
+            .unwrap();
+
+        assert_eq!(output.final_message, "I could not read it.");
+        assert_eq!(
+            output.tool_results[0].content,
+            r#"{"error":"file was not found"}"#
+        );
+        assert_eq!(
+            output.messages[2].content,
+            r#"{"error":"file was not found"}"#
+        );
     }
 
     struct FakeProvider {
