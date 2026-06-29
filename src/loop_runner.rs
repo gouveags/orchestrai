@@ -309,7 +309,7 @@ where
     ) -> Result<PreparedRequest, LoopError> {
         let mut call = BeforeModelCall {
             state: state.clone(),
-            config: self.call_config_for_state(options),
+            config: self.call_config_for_state(options)?,
         };
 
         if let Some(hook) = &options.before_model_call {
@@ -332,18 +332,24 @@ where
         })
     }
 
-    fn call_config_for_state(&self, options: &RunStateCallOptions) -> ModelCallConfig {
+    fn call_config_for_state(
+        &self,
+        options: &RunStateCallOptions,
+    ) -> Result<ModelCallConfig, LoopError> {
         let mut model = self.config.model.clone();
         if let Some(mode) = &options.model_mode {
-            if let Some(mode_model) = options.model_modes.get(mode) {
-                model = mode_model.clone();
-            }
+            let Some(mode_model) = options.model_modes.get(mode) else {
+                return Err(LoopError::Provider(ProviderError::Config(format!(
+                    "model mode `{mode}` is not configured"
+                ))));
+            };
+            model = mode_model.clone();
         }
 
-        ModelCallConfig {
+        Ok(ModelCallConfig {
             model,
             max_tokens: self.config.max_tokens,
-        }
+        })
     }
 
     fn prepare_messages(&self, messages: Vec<Message>) -> PreparedMessages {
