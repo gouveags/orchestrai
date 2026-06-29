@@ -1,9 +1,10 @@
 use crate::{
+    capabilities::{CapabilityBundleSet, CapabilitySelection},
     loop_runner::{
         AgentLoop, AgentLoopConfig, BeforeModelCallHook, LoopError, LoopEvent, LoopOutput,
         RunStateCallOptions,
     },
-    provider::ModelProvider,
+    provider::{CachePolicy, ModelProvider},
     run_state::{BeforeModelCall, RunOptions, RunState, StateInstructionPolicy},
     tool::{Tool, ToolRegistry},
     types::Message,
@@ -27,6 +28,8 @@ pub struct AgentConfig<P> {
     pub tools: ToolRegistry,
     pub max_tool_rounds: usize,
     pub max_tokens: Option<u32>,
+    pub capability_bundles: CapabilityBundleSet,
+    pub cache_policy: CachePolicy,
     pub(crate) run_state_instructions: Option<StateInstructionPolicy>,
     pub(crate) model_modes: BTreeMap<String, String>,
     pub(crate) before_model_call: Option<BeforeModelCallHook>,
@@ -41,6 +44,8 @@ impl<P> AgentConfig<P> {
             tools: ToolRegistry::new(),
             max_tool_rounds: 8,
             max_tokens: None,
+            capability_bundles: CapabilityBundleSet::new(),
+            cache_policy: CachePolicy::disabled(),
             run_state_instructions: None,
             model_modes: BTreeMap::new(),
             before_model_call: None,
@@ -72,6 +77,16 @@ impl<P> AgentConfig<P> {
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    pub fn with_capability_bundles(mut self, capability_bundles: CapabilityBundleSet) -> Self {
+        self.capability_bundles = capability_bundles;
+        self
+    }
+
+    pub fn with_cache_policy(mut self, cache_policy: CachePolicy) -> Self {
+        self.cache_policy = cache_policy;
         self
     }
 
@@ -122,6 +137,9 @@ where
         if let Some(max_tokens) = config.max_tokens {
             loop_config = loop_config.with_max_tokens(max_tokens);
         }
+        loop_config = loop_config
+            .with_capability_bundles(config.capability_bundles)
+            .with_cache_policy(config.cache_policy);
 
         Self {
             loop_runner: AgentLoop::new(config.provider, config.tools, loop_config),
@@ -137,6 +155,15 @@ where
 
     pub async fn run(&self, input: impl Into<String>) -> Result<AgentOutput, LoopError> {
         self.run_messages(vec![Message::user(input.into())]).await
+    }
+
+    pub async fn run_with_capabilities(
+        &self,
+        input: impl Into<String>,
+        selection: CapabilitySelection,
+    ) -> Result<AgentOutput, LoopError> {
+        self.run_messages_with_capabilities(vec![Message::user(input.into())], selection)
+            .await
     }
 
     pub async fn run_with_state(
@@ -159,6 +186,16 @@ where
 
     pub async fn run_messages(&self, messages: Vec<Message>) -> Result<AgentOutput, LoopError> {
         self.loop_runner.run(self.prepare_messages(messages)).await
+    }
+
+    pub async fn run_messages_with_capabilities(
+        &self,
+        messages: Vec<Message>,
+        selection: CapabilitySelection,
+    ) -> Result<AgentOutput, LoopError> {
+        self.loop_runner
+            .run_with_capabilities(self.prepare_messages(messages), selection)
+            .await
     }
 
     pub async fn run_messages_with_state(
