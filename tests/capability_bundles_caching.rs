@@ -6,9 +6,10 @@ use serde_json::json;
 
 use orchestrai::{
     AgentConfig, CacheHint, CacheHintScope, CachePolicy, CapabilityBundle, CapabilityBundleSet,
-    CapabilityError, CapabilitySelection, FnTool, LoopError, ModelProvider, ModelRequest,
-    ModelResponse, ModelStream, ModelStreamEvent, ProviderError, ProviderFeature, ProviderResult,
-    Tool, ToolDefinition, create_agent,
+    CapabilityError, CapabilitySelection, FnTool, LoopError, ModelCatalog, ModelProvider,
+    ModelRequest, ModelResponse, ModelStream, ModelStreamEvent, ProviderError, ProviderFeature,
+    ProviderModel, ProviderRegistry, ProviderResult, RoutedModelProvider, Tool, ToolDefinition,
+    create_agent,
 };
 
 #[tokio::test]
@@ -168,6 +169,41 @@ async fn prompt_cache_hints_are_sent_to_supported_providers_and_unsupported_erro
         unsupported_requests.take().len(),
         0,
         "unsupported cache hints should fail before the provider call"
+    );
+}
+
+#[tokio::test]
+async fn prompt_cache_support_is_checked_after_model_alias_routing() {
+    let routed_requests = RecordedRequests::default();
+    let provider = RoutedModelProvider::new(
+        ProviderRegistry::new().with_provider(
+            "anthropic",
+            Arc::new(InspectingProvider::supported(routed_requests.clone())),
+        ),
+        ModelCatalog::new().with_alias(
+            "team-regular",
+            [ProviderModel::new("anthropic", "claude-sonnet-4-6")],
+        ),
+    );
+    let agent = create_agent(
+        AgentConfig::new(provider, "team-regular")
+            .with_capability_bundles(CapabilityBundleSet::new().with_default(
+                CapabilityBundle::new("default").with_prompt("Cached routed prompt."),
+            ))
+            .with_cache_policy(CachePolicy::provider_prompt_cache()),
+    );
+
+    agent.run("use routed prompt cache").await.unwrap();
+
+    let requests = routed_requests.take();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, "claude-sonnet-4-6");
+    assert_eq!(
+        requests[0].cache_hints,
+        vec![
+            CacheHint::new(CacheHintScope::SystemPrompt { message_index: 0 })
+                .for_feature(ProviderFeature::PromptCache),
+        ]
     );
 }
 

@@ -142,6 +142,19 @@ impl RoutedModelProvider {
 
 #[async_trait]
 impl ModelProvider for RoutedModelProvider {
+    fn ensure_supports(
+        &self,
+        model: &str,
+        feature: crate::provider::ProviderFeature,
+    ) -> ProviderResult<()> {
+        let route = self.route_for(model)?;
+        let primary = route
+            .first()
+            .expect("route_for returns only non-empty routes");
+        self.provider(&primary.provider)?
+            .ensure_supports(&primary.model, feature)
+    }
+
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
         let route = self.route_for(&request.model)?;
         let last_index = route.len() - 1;

@@ -109,6 +109,14 @@ pub trait ModelProvider: Send + Sync {
         false
     }
 
+    fn ensure_supports(&self, _model: &str, feature: ProviderFeature) -> ProviderResult<()> {
+        if self.supports(feature) {
+            Ok(())
+        } else {
+            Err(ProviderError::UnsupportedFeature(feature))
+        }
+    }
+
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse>;
 
     async fn stream(&self, request: ModelRequest) -> ProviderResult<ModelStream>;

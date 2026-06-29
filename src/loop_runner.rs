@@ -418,9 +418,9 @@ where
             return Ok(());
         }
 
-        if !self.provider.supports(ProviderFeature::PromptCache) {
-            return Err(ProviderError::UnsupportedFeature(ProviderFeature::PromptCache).into());
-        }
+        self.provider
+            .ensure_supports(&request.model, ProviderFeature::PromptCache)
+            .map_err(LoopError::Provider)?;
 
         if let Some(message_index) = request
             .messages
