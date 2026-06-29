@@ -1,9 +1,15 @@
 use crate::{
-    loop_runner::{AgentLoop, AgentLoopConfig, LoopError, LoopEvent, LoopOutput},
+    loop_runner::{
+        AgentLoop, AgentLoopConfig, BeforeModelCallHook, LoopError, LoopEvent, LoopOutput,
+        RunStateCallOptions,
+    },
     provider::ModelProvider,
+    run_state::{BeforeModelCall, RunState, StateInstructionPolicy},
     tool::{Tool, ToolRegistry},
     types::Message,
 };
+
+use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 
 pub type AgentOutput = LoopOutput;
 
@@ -21,6 +27,9 @@ pub struct AgentConfig<P> {
     pub tools: ToolRegistry,
     pub max_tool_rounds: usize,
     pub max_tokens: Option<u32>,
+    pub(crate) run_state_instructions: Option<StateInstructionPolicy>,
+    pub(crate) model_modes: BTreeMap<String, String>,
+    pub(crate) before_model_call: Option<BeforeModelCallHook>,
 }
 
 impl<P> AgentConfig<P> {
@@ -32,6 +41,9 @@ impl<P> AgentConfig<P> {
             tools: ToolRegistry::new(),
             max_tool_rounds: 8,
             max_tokens: None,
+            run_state_instructions: None,
+            model_modes: BTreeMap::new(),
+            before_model_call: None,
         }
     }
 
@@ -62,11 +74,42 @@ impl<P> AgentConfig<P> {
         self.max_tokens = Some(max_tokens);
         self
     }
+
+    pub fn with_run_state_instructions(mut self, policy: StateInstructionPolicy) -> Self {
+        self.run_state_instructions = Some(policy);
+        self
+    }
+
+    pub fn with_model_modes<I, K, V>(mut self, modes: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.model_modes = modes
+            .into_iter()
+            .map(|(mode, model)| (mode.into(), model.into()))
+            .collect();
+        self
+    }
+
+    pub fn with_before_model_call<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(BeforeModelCall) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<BeforeModelCall, LoopError>> + Send + 'static,
+    {
+        self.before_model_call = Some(Arc::new(move |call| {
+            Box::pin(hook(call))
+                as Pin<Box<dyn Future<Output = Result<BeforeModelCall, LoopError>> + Send>>
+        }));
+        self
+    }
 }
 
 pub struct Agent<P> {
     loop_runner: AgentLoop<P>,
     instructions: Option<String>,
+    run_state_options: RunStateCallOptions,
 }
 
 impl<P> Agent<P>
@@ -83,6 +126,11 @@ where
         Self {
             loop_runner: AgentLoop::new(config.provider, config.tools, loop_config),
             instructions: config.instructions,
+            run_state_options: RunStateCallOptions {
+                instruction_policy: config.run_state_instructions,
+                model_modes: config.model_modes,
+                before_model_call: config.before_model_call,
+            },
         }
     }
 
@@ -90,8 +138,31 @@ where
         self.run_messages(vec![Message::user(input.into())]).await
     }
 
+    pub async fn run_with_state(
+        &self,
+        input: impl Into<String>,
+        state: RunState,
+    ) -> Result<AgentOutput, LoopError> {
+        self.run_messages_with_state(vec![Message::user(input.into())], state)
+            .await
+    }
+
     pub async fn run_messages(&self, messages: Vec<Message>) -> Result<AgentOutput, LoopError> {
         self.loop_runner.run(self.prepare_messages(messages)).await
+    }
+
+    pub async fn run_messages_with_state(
+        &self,
+        messages: Vec<Message>,
+        state: RunState,
+    ) -> Result<AgentOutput, LoopError> {
+        self.loop_runner
+            .run_with_state(
+                self.prepare_messages(messages),
+                state,
+                self.run_state_options.clone(),
+            )
+            .await
     }
 
     pub async fn run_stream<F, Fut>(

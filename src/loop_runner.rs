@@ -1,11 +1,31 @@
+use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
+
 use futures_util::StreamExt;
 
 use crate::{
     provider::{ModelProvider, ModelRequest, ModelResponse, ModelStreamEvent, ProviderError},
+    run_state::{
+        BeforeModelCall, MODEL_MODE_STATE_KEY, ModelCallConfig, RunState, StateInstructionPolicy,
+    },
     summarization::{ConversationSummary, PreparedMessages, SummaryPolicy},
     tool::{ToolError, ToolRegistry},
     types::{Message, ToolCall, ToolResult},
 };
+
+pub(crate) type BeforeModelCallHook = Arc<
+    dyn Fn(
+            BeforeModelCall,
+        ) -> Pin<Box<dyn Future<Output = Result<BeforeModelCall, LoopError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone, Default)]
+pub(crate) struct RunStateCallOptions {
+    pub instruction_policy: Option<StateInstructionPolicy>,
+    pub model_modes: BTreeMap<String, String>,
+    pub before_model_call: Option<BeforeModelCallHook>,
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentLoopConfig {
@@ -65,6 +85,49 @@ where
 
         for _round in 0..=self.config.max_tool_rounds {
             let model_call = self.call_model(messages.clone()).await?;
+            let injected_summary = model_call.injected_summary;
+            let response = model_call.response;
+            messages.push(Message::assistant_with_tool_calls(
+                response.message.clone(),
+                response.tool_calls.clone(),
+            ));
+
+            if response.tool_calls.is_empty() {
+                return Ok(LoopOutput {
+                    final_message: response.message,
+                    messages,
+                    tool_results: all_tool_results,
+                    injected_summary,
+                });
+            }
+
+            let tool_results = self.execute_tool_calls(&response.tool_calls).await?;
+            for result in &tool_results {
+                messages.push(Message::tool(
+                    result.tool_call_id.clone(),
+                    result.content.clone(),
+                ));
+            }
+            all_tool_results.extend(tool_results);
+        }
+
+        Err(LoopError::TooManyToolRounds(self.config.max_tool_rounds))
+    }
+
+    pub(crate) async fn run_with_state(
+        &self,
+        messages: Vec<Message>,
+        state: RunState,
+        options: RunStateCallOptions,
+    ) -> Result<LoopOutput, LoopError> {
+        let mut messages = messages;
+        let mut state = state;
+        let mut all_tool_results = Vec::new();
+
+        for _round in 0..=self.config.max_tool_rounds {
+            let model_call = self
+                .call_model_with_state(messages.clone(), &mut state, &options)
+                .await?;
             let injected_summary = model_call.injected_summary;
             let response = model_call.response;
             messages.push(Message::assistant_with_tool_calls(
@@ -205,6 +268,25 @@ where
         })
     }
 
+    async fn call_model_with_state(
+        &self,
+        messages: Vec<Message>,
+        state: &mut RunState,
+        options: &RunStateCallOptions,
+    ) -> Result<ModelCall, LoopError> {
+        let prepared = self.request_with_state(messages, state, options).await?;
+        let response = self
+            .provider
+            .complete(prepared.request)
+            .await
+            .map_err(LoopError::Provider)?;
+
+        Ok(ModelCall {
+            response,
+            injected_summary: prepared.injected_summary,
+        })
+    }
+
     fn request(&self, messages: Vec<Message>) -> PreparedRequest {
         let prepared_messages = self.prepare_messages(messages);
         let request = ModelRequest {
@@ -220,6 +302,55 @@ where
         }
     }
 
+    async fn request_with_state(
+        &self,
+        messages: Vec<Message>,
+        state: &mut RunState,
+        options: &RunStateCallOptions,
+    ) -> Result<PreparedRequest, LoopError> {
+        let mut call = BeforeModelCall {
+            state: state.clone(),
+            config: self.call_config_for_state(state, options),
+        };
+
+        if let Some(hook) = &options.before_model_call {
+            call = hook(call).await?;
+        }
+
+        *state = call.state;
+        let prepared_messages =
+            self.prepare_messages_with_state(messages, state, options.instruction_policy.as_ref());
+        let request = ModelRequest {
+            model: call.config.model,
+            messages: prepared_messages.messages,
+            tools: self.tools.definitions(),
+            max_tokens: call.config.max_tokens,
+        };
+
+        Ok(PreparedRequest {
+            request,
+            injected_summary: prepared_messages.injected_summary,
+        })
+    }
+
+    fn call_config_for_state(
+        &self,
+        state: &RunState,
+        options: &RunStateCallOptions,
+    ) -> ModelCallConfig {
+        let mut model = self.config.model.clone();
+        if let Some(mode) = state.get_string(MODEL_MODE_STATE_KEY) {
+            if let Some(mode_model) = options.model_modes.get(&mode) {
+                model = mode_model.clone();
+            }
+        }
+
+        ModelCallConfig {
+            model,
+            max_tokens: self.config.max_tokens,
+        }
+    }
+
     fn prepare_messages(&self, messages: Vec<Message>) -> PreparedMessages {
         if let Some(policy) = &self.config.summary_policy {
             return policy.prepare(&messages);
@@ -229,6 +360,40 @@ where
             messages,
             injected_summary: None,
         }
+    }
+
+    fn prepare_messages_with_state(
+        &self,
+        messages: Vec<Message>,
+        state: &RunState,
+        policy: Option<&StateInstructionPolicy>,
+    ) -> PreparedMessages {
+        let mut prepared = if let Some(policy) = &self.config.summary_policy {
+            policy.prepare(&messages)
+        } else {
+            PreparedMessages {
+                messages,
+                injected_summary: None,
+            }
+        };
+
+        let Some(state_policy) = policy else {
+            return prepared;
+        };
+        let Some(state_instructions) = state.rendered_instructions(state_policy) else {
+            return prepared;
+        };
+
+        match prepared.messages.first_mut() {
+            Some(message) if message.role == crate::types::Role::System => {
+                message.content = format!("{}\n\n{state_instructions}", message.content);
+            }
+            _ => prepared
+                .messages
+                .insert(0, Message::system(state_instructions)),
+        }
+
+        prepared
     }
 
     async fn execute_tool_calls(
