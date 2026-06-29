@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::types::ToolDefinition;
 
 pub type ToolResult<T> = Result<T, ToolError>;
-type BoxToolFuture = Pin<Box<dyn Future<Output = ToolResult<String>> + Send>>;
+pub(crate) type BoxToolFuture = Pin<Box<dyn Future<Output = ToolResult<String>> + Send>>;
 
 #[async_trait]
 pub trait Tool: Send + Sync {
