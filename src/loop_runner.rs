@@ -21,6 +21,16 @@ impl AgentLoopConfig {
             max_tokens: None,
         }
     }
+
+    pub fn with_max_tool_rounds(mut self, max_tool_rounds: usize) -> Self {
+        self.max_tool_rounds = max_tool_rounds;
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
 }
 
 pub struct AgentLoop<P> {
