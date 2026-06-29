@@ -24,7 +24,7 @@ impl ProviderModel {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ProviderRegistry {
     providers: HashMap<String, Arc<dyn ModelProvider>>,
 }
@@ -166,18 +166,19 @@ impl ModelProvider for RoutedModelProvider {
 
     async fn stream(&self, request: ModelRequest) -> ProviderResult<ModelStream> {
         let route = self.route_for(&request.model)?;
-        let attempts = route
-            .iter()
-            .map(|provider_model| {
-                self.provider(&provider_model.provider)
-                    .map(|provider| (provider_model.clone(), provider))
-            })
-            .collect::<ProviderResult<Vec<_>>>()?;
+        let route = route.to_vec();
+        let registry = self.registry.clone();
         let last_index = route.len() - 1;
         let fallback_policy = self.fallback_policy;
 
         Ok(Box::pin(try_stream! {
-            for (index, (provider_model, provider)) in attempts.iter().enumerate() {
+            for (index, provider_model) in route.iter().enumerate() {
+                let provider = registry.provider(&provider_model.provider).ok_or_else(|| {
+                    ProviderError::Config(format!(
+                        "provider `{}` is not registered",
+                        provider_model.provider
+                    ))
+                })?;
                 let routed_request = request_for_model(&request, &provider_model.model);
                 let mut stream = match provider.stream(routed_request).await {
                     Ok(stream) => stream,
