@@ -225,13 +225,14 @@ async fn sub_agent_recoverable_tool_errors_are_returned_as_parent_visible_tool_c
 #[tokio::test]
 async fn missing_or_forbidden_sub_agent_mounts_fail_the_parent_loop_hard() {
     let mut sub_agents = SubAgentRegistry::new();
+    let private_requests = Arc::new(Mutex::new(Vec::new()));
     sub_agents.register(
         SubAgentDefinition::new(
             "private_reviewer",
             AgentConfig::new(
                 FakeProvider::sequence(
                     vec![text_response("forbidden")],
-                    Arc::new(Mutex::new(vec![])),
+                    Arc::clone(&private_requests),
                 ),
                 "fake-private-model",
             ),
@@ -249,7 +250,7 @@ async fn missing_or_forbidden_sub_agent_mounts_fail_the_parent_loop_hard() {
     )
     .await
     .unwrap_err();
-    assert_hard_sub_agent_mount_error(missing_error, "unknown_reviewer");
+    assert_unknown_sub_agent_mount_error(missing_error, "unknown_reviewer");
 
     let forbidden_error = run_parent_once_with_sub_agent_call(
         sub_agents,
@@ -261,7 +262,11 @@ async fn missing_or_forbidden_sub_agent_mounts_fail_the_parent_loop_hard() {
     )
     .await
     .unwrap_err();
-    assert_hard_sub_agent_mount_error(forbidden_error, "private_reviewer");
+    assert_forbidden_sub_agent_mount_error(forbidden_error, "private_reviewer");
+    assert!(
+        private_requests.lock().unwrap().is_empty(),
+        "forbidden sub-agent provider must not be called"
+    );
 }
 
 async fn run_parent_once_with_sub_agent_call(
@@ -287,15 +292,22 @@ async fn run_parent_once_with_sub_agent_call(
     .await
 }
 
-fn assert_hard_sub_agent_mount_error(error: LoopError, expected_agent: &str) {
+fn assert_unknown_sub_agent_mount_error(error: LoopError, expected_agent: &str) {
     match error {
-        LoopError::Tool(ToolError::Execution(message)) => {
-            assert!(message.contains(expected_agent), "{message}");
-        }
         LoopError::Tool(ToolError::NotFound(name)) => {
             assert_eq!(name, expected_agent);
         }
-        other => panic!("expected hard sub-agent mount failure, got {other:?}"),
+        other => panic!("expected unknown sub-agent mount failure, got {other:?}"),
+    }
+}
+
+fn assert_forbidden_sub_agent_mount_error(error: LoopError, expected_agent: &str) {
+    match error {
+        LoopError::Tool(ToolError::Execution(message)) => {
+            assert!(message.contains(expected_agent), "{message}");
+            assert!(message.contains("not runtime mountable"), "{message}");
+        }
+        other => panic!("expected forbidden sub-agent mount failure, got {other:?}"),
     }
 }
 
