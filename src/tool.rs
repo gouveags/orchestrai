@@ -49,7 +49,7 @@ where
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
 }
@@ -64,6 +64,10 @@ impl ToolRegistry {
         T: Tool + 'static,
     {
         self.tools.insert(tool.definition().name, Arc::new(tool));
+    }
+
+    pub(crate) fn register_arc(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.insert(tool.definition().name, tool);
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
