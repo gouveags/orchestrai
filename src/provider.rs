@@ -14,6 +14,7 @@ pub struct ModelRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
+    pub cache_hints: Vec<CacheHint>,
 }
 
 impl ModelRequest {
@@ -23,7 +24,62 @@ impl ModelRequest {
             messages,
             tools: Vec::new(),
             max_tokens: None,
+            cache_hints: Vec::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFeature {
+    PromptCache,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheHint {
+    pub scope: CacheHintScope,
+    pub feature: ProviderFeature,
+}
+
+impl CacheHint {
+    pub fn new(scope: CacheHintScope) -> Self {
+        Self {
+            scope,
+            feature: ProviderFeature::PromptCache,
+        }
+    }
+
+    pub fn for_feature(mut self, feature: ProviderFeature) -> Self {
+        self.feature = feature;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheHintScope {
+    SystemPrompt { message_index: usize },
+    ToolDefinitions,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CachePolicy {
+    provider_prompt_cache: bool,
+}
+
+impl CachePolicy {
+    pub fn disabled() -> Self {
+        Self {
+            provider_prompt_cache: false,
+        }
+    }
+
+    pub fn provider_prompt_cache() -> Self {
+        Self {
+            provider_prompt_cache: true,
+        }
+    }
+
+    pub(crate) fn uses_provider_prompt_cache(self) -> bool {
+        self.provider_prompt_cache
     }
 }
 
@@ -49,6 +105,18 @@ pub enum ModelStreamEvent {
 
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
+    fn supports(&self, _feature: ProviderFeature) -> bool {
+        false
+    }
+
+    fn ensure_supports(&self, _model: &str, feature: ProviderFeature) -> ProviderResult<()> {
+        if self.supports(feature) {
+            Ok(())
+        } else {
+            Err(ProviderError::UnsupportedFeature(feature))
+        }
+    }
+
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse>;
 
     async fn stream(&self, request: ModelRequest) -> ProviderResult<ModelStream>;
@@ -69,6 +137,8 @@ pub enum ProviderError {
     Parse(String),
     #[error("provider configuration is invalid: {0}")]
     Config(String),
+    #[error("provider does not support feature {0:?}")]
+    UnsupportedFeature(ProviderFeature),
 }
 
 pub(crate) async fn error_for_status(

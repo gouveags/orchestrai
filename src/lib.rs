@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod capabilities;
 pub mod environment;
 pub mod filesystem_tools;
 pub mod loop_runner;
@@ -15,6 +16,9 @@ pub mod types;
 pub mod python;
 
 pub use agent::{Agent, AgentConfig, AgentOutput, create_agent};
+pub use capabilities::{
+    CapabilityBundle, CapabilityBundleSet, CapabilityError, CapabilitySelection,
+};
 pub use environment::{
     DirectoryEntry, EntryKind, EnvironmentError, FileEnvironment, LocalEnvironment, SearchMatch,
     SearchOutput, WriteFileOutput,
@@ -27,7 +31,10 @@ pub use model_routing::{
     FallbackPolicy, ModelCatalog, ProviderModel, ProviderRegistry, RoutedModelProvider,
 };
 pub use planning::{Plan, PlanItem, PlanItemStatus, PlanToolSet};
-pub use provider::{ModelProvider, ModelRequest, ModelResponse, ModelStream};
+pub use provider::{
+    CacheHint, CacheHintScope, CachePolicy, ModelProvider, ModelRequest, ModelResponse,
+    ModelStream, ModelStreamEvent, ProviderError, ProviderFeature, ProviderResult,
+};
 pub use run_state::{
     BeforeModelCall, ModelCallConfig, RunOptions, RunState, RunStateError, StateInstructionPolicy,
 };
