@@ -1,10 +1,19 @@
+pub mod environment;
+pub mod filesystem_tools;
 pub mod loop_runner;
 pub mod provider;
 pub mod providers;
 pub mod tool;
 pub mod types;
 
+pub use environment::{
+    DirectoryEntry, EntryKind, EnvironmentError, FileEnvironment, LocalEnvironment, SearchMatch,
+    SearchOutput, WriteFileOutput,
+};
+pub use filesystem_tools::{
+    LIST_FILES_TOOL, READ_FILE_TOOL, SEARCH_FILES_TOOL, WRITE_FILE_TOOL, register_filesystem_tools,
+};
 pub use loop_runner::{AgentLoop, AgentLoopConfig, LoopEvent, LoopOutput};
 pub use provider::{ModelProvider, ModelRequest, ModelResponse, ModelStream};
-pub use tool::{FnTool, Tool, ToolRegistry};
+pub use tool::{FnTool, Tool, ToolError, ToolRegistry};
 pub use types::{ContentBlock, Message, Role, ToolCall, ToolDefinition, ToolResult, Usage};
