@@ -133,6 +133,12 @@ shared across agents, `LoopOutput::usage_snapshot()` reports the per-run delta,
 and `UsageLimits` fails closed before provider calls when an existing budget is
 already exhausted.
 
+`UsageSnapshot.model_calls` counts logical orchestrai model requests made by the
+loop: one `ModelProvider::complete` or `ModelProvider::stream` invocation. It
+does not count provider-internal retry or fallback attempts inside an adapter.
+The loop reserves model and tool calls before awaiting provider or tool work so
+shared meters enforce call limits across concurrent runs.
+
 ```rust
 use orchestrai::{UsageLimits, UsageMeter};
 
