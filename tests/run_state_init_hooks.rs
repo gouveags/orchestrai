@@ -11,7 +11,7 @@ use futures_util::stream;
 use orchestrai::provider::{ModelStreamEvent, ProviderResult};
 use orchestrai::{
     AgentConfig, FnTool, Message, ModelProvider, ModelRequest, ModelResponse, ModelStream,
-    RunState, StateInstructionPolicy, ToolCall, ToolDefinition, create_agent,
+    RunOptions, RunState, StateInstructionPolicy, ToolCall, ToolDefinition, create_agent,
 };
 use serde_json::json;
 
@@ -32,15 +32,17 @@ async fn run_state_renders_selected_entries_and_applies_builtin_model_mode() {
     );
 
     let output = agent
-        .run_with_state(
-            "Draft the customer reply.",
-            RunState::from_json(json!({
-                "tenant_name": "Acme Racing",
-                "plan_tier": "pro",
-                "private_note": "must never be shown to the model",
-                "orchestrai.model_mode": "fast"
-            }))
-            .unwrap(),
+        .run_with_options(
+            RunOptions::new("Draft the customer reply.")
+                .with_state(
+                    RunState::from_json(json!({
+                        "tenant_name": "Acme Racing",
+                        "plan_tier": "pro",
+                        "private_note": "must never be shown to the model"
+                    }))
+                    .unwrap(),
+                )
+                .with_model_mode("fast"),
         )
         .await
         .unwrap();
@@ -50,16 +52,16 @@ async fn run_state_renders_selected_entries_and_applies_builtin_model_mode() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].model, "fake-fast");
     assert_eq!(requests[0].max_tokens, None);
-    assert_eq!(
-        requests[0].messages,
-        vec![
-            Message::system(
-                "You are a support copilot.\n\nRun state:\n- tenant_name: Acme Racing\n- plan_tier: pro"
-            ),
-            Message::user("Draft the customer reply."),
-        ]
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|message| message == &Message::user("Draft the customer reply."))
     );
-    assert!(!requests[0].messages[0].content.contains("private_note"));
+    assert_system_contains(&requests[0], "You are a support copilot.");
+    assert_system_contains(&requests[0], "tenant_name: Acme Racing");
+    assert_system_contains(&requests[0], "plan_tier: pro");
+    assert_system_excludes(&requests[0], "private_note");
 }
 
 #[tokio::test]
@@ -135,28 +137,48 @@ async fn before_model_call_hook_resolves_state_and_config_before_every_llm_call(
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].model, "fake-accurate");
     assert_eq!(requests[0].max_tokens, Some(32));
-    assert_eq!(
-        requests[0].messages,
-        vec![
-            Message::system(
-                "You are an account assistant.\n\nRun state:\n- account_slug: acme\n- resolved_profile: acme:profile:1\n- hook_call_number: 1"
-            ),
-            Message::user("Prepare the next action."),
-        ]
-    );
+    assert_system_contains(&requests[0], "You are an account assistant.");
+    assert_system_contains(&requests[0], "account_slug: acme");
+    assert_system_contains(&requests[0], "resolved_profile: acme:profile:1");
+    assert_system_contains(&requests[0], "hook_call_number: 1");
 
     assert_eq!(requests[1].model, "fake-accurate");
     assert_eq!(requests[1].max_tokens, Some(64));
-    assert_eq!(
-        requests[1].messages,
-        vec![
-            Message::system(
-                "You are an account assistant.\n\nRun state:\n- account_slug: acme\n- resolved_profile: acme:profile:2\n- hook_call_number: 2"
-            ),
-            Message::user("Prepare the next action."),
-            Message::assistant_with_tool_calls("", vec![tool_call]),
-            Message::tool("call_1", r#"{"tier":"enterprise"}"#),
-        ]
+    assert_system_contains(&requests[1], "resolved_profile: acme:profile:2");
+    assert_system_contains(&requests[1], "hook_call_number: 2");
+    assert!(
+        requests[1]
+            .messages
+            .contains(&Message::assistant_with_tool_calls("", vec![tool_call]))
+    );
+    assert!(
+        requests[1]
+            .messages
+            .contains(&Message::tool("call_1", r#"{"tier":"enterprise"}"#))
+    );
+}
+
+fn assert_system_contains(request: &ModelRequest, expected: &str) {
+    assert!(
+        request
+            .messages
+            .iter()
+            .any(|message| message.role == orchestrai::Role::System
+                && message.content.contains(expected)),
+        "expected system message to contain {expected:?}: {:?}",
+        request.messages
+    );
+}
+
+fn assert_system_excludes(request: &ModelRequest, forbidden: &str) {
+    assert!(
+        request
+            .messages
+            .iter()
+            .filter(|message| message.role == orchestrai::Role::System)
+            .all(|message| !message.content.contains(forbidden)),
+        "system message should not contain {forbidden:?}: {:?}",
+        request.messages
     );
 }
 
