@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "orchestrai"
+version = "0.1.0"
+description = "A small AI orchestrator SDK with Rust-first APIs and Python bindings."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+
+[tool.maturin]
+bindings = "pyo3"
+features = ["python"]
+module-name = "orchestrai"
