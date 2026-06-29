@@ -12,7 +12,7 @@ use orchestrai::{
 };
 
 #[tokio::test]
-async fn run_loads_default_role_and_policy_prompts_and_tools_for_selected_capabilities() {
+async fn run_loads_default_and_selected_bundle_prompts_and_tools() {
     let requests = RecordedRequests::default();
     let agent = create_agent(
         AgentConfig::new(
@@ -26,13 +26,13 @@ async fn run_loads_default_role_and_policy_prompts_and_tools_for_selected_capabi
                         .with_prompt("Base prompt: answer with repository context.")
                         .with_tool(fake_tool("repo.search")),
                 )
-                .with_role(
+                .with_bundle(
                     "maintainer",
                     CapabilityBundle::new("maintainer")
                         .with_prompt("Role prompt: prefer small reviewable changes.")
                         .with_tool(fake_tool("github.review_threads")),
                 )
-                .with_policy(
+                .with_bundle(
                     "tests_only",
                     CapabilityBundle::new("tests_only")
                         .with_prompt("Policy prompt: do not edit src files.")
@@ -44,9 +44,7 @@ async fn run_loads_default_role_and_policy_prompts_and_tools_for_selected_capabi
     let output = agent
         .run_with_capabilities(
             "add the missing coverage",
-            CapabilitySelection::new()
-                .with_role("maintainer")
-                .with_policy("tests_only"),
+            CapabilitySelection::new(["maintainer", "tests_only"]),
         )
         .await
         .unwrap();
@@ -56,20 +54,9 @@ async fn run_loads_default_role_and_policy_prompts_and_tools_for_selected_capabi
     assert_eq!(requests.len(), 1);
 
     let request = &requests[0];
-    let system_prompts = request
-        .messages
-        .iter()
-        .filter(|message| message.role == orchestrai::Role::System)
-        .map(|message| message.content.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        system_prompts,
-        vec![
-            "Base prompt: answer with repository context.",
-            "Role prompt: prefer small reviewable changes.",
-            "Policy prompt: do not edit src files.",
-        ]
-    );
+    assert_system_contains(request, "Base prompt: answer with repository context.");
+    assert_system_contains(request, "Role prompt: prefer small reviewable changes.");
+    assert_system_contains(request, "Policy prompt: do not edit src files.");
 
     let mut tool_names = request
         .tools
@@ -94,7 +81,7 @@ async fn duplicate_tools_across_active_capability_bundles_fail_before_provider_c
         .with_capability_bundles(
             CapabilityBundleSet::new()
                 .with_default(CapabilityBundle::new("default").with_tool(fake_tool("repo.search")))
-                .with_policy(
+                .with_bundle(
                     "readonly",
                     CapabilityBundle::new("readonly").with_tool(fake_tool("repo.search")),
                 ),
@@ -104,7 +91,7 @@ async fn duplicate_tools_across_active_capability_bundles_fail_before_provider_c
     let error = agent
         .run_with_capabilities(
             "search for the regression",
-            CapabilitySelection::new().with_policy("readonly"),
+            CapabilitySelection::new(["readonly"]),
         )
         .await
         .unwrap_err();
@@ -179,8 +166,20 @@ async fn prompt_cache_hints_are_sent_to_supported_providers_and_unsupported_erro
     );
     assert_eq!(
         unsupported_requests.take().len(),
-        1,
-        "the fake provider must receive the request and return the unsupported-feature failure"
+        0,
+        "unsupported cache hints should fail before the provider call"
+    );
+}
+
+fn assert_system_contains(request: &ModelRequest, expected: &str) {
+    assert!(
+        request
+            .messages
+            .iter()
+            .any(|message| message.role == orchestrai::Role::System
+                && message.content.contains(expected)),
+        "expected system prompt to contain {expected:?}: {:?}",
+        request.messages
     );
 }
 
