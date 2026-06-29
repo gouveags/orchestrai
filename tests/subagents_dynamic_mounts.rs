@@ -11,7 +11,7 @@ use orchestrai::{
 };
 use serde_json::{Value, json};
 
-const DEFAULT_SUB_AGENT_TOOL_NAME: &str = "agent.run";
+const DEFAULT_SUB_AGENT_TOOL_NAME: &str = "agent_run";
 
 #[tokio::test]
 async fn default_sub_agent_tool_runs_named_agent_with_scoped_payload_inside_parent_loop() {
@@ -131,6 +131,7 @@ async fn runtime_mount_permissions_limit_which_sub_agents_are_exposed_to_the_par
     let definition = tool.definition();
 
     assert_eq!(definition.name, DEFAULT_SUB_AGENT_TOOL_NAME);
+    assert!(definition.description.contains("research"));
     assert_json_array_contains(
         &definition.input_schema,
         &["properties", "agent", "enum"],
@@ -267,6 +268,45 @@ async fn missing_or_forbidden_sub_agent_mounts_fail_the_parent_loop_hard() {
         private_requests.lock().unwrap().is_empty(),
         "forbidden sub-agent provider must not be called"
     );
+}
+
+#[tokio::test]
+async fn non_object_sub_agent_state_fails_before_calling_child_provider() {
+    let child_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut sub_agents = SubAgentRegistry::new();
+    sub_agents.register(
+        SubAgentDefinition::new(
+            "researcher",
+            AgentConfig::new(
+                FakeProvider::sequence(
+                    vec![text_response("should not run")],
+                    Arc::clone(&child_requests),
+                ),
+                "fake-child-model",
+            ),
+        )
+        .with_mount_permissions(SubAgentMountPermissions::runtime_mountable()),
+    );
+
+    let error = run_parent_once_with_sub_agent_call(
+        sub_agents,
+        json!({
+            "agent": "researcher",
+            "input": "try malformed state",
+            "state": ["not", "an", "object"]
+        }),
+    )
+    .await
+    .unwrap_err();
+
+    match error {
+        LoopError::Tool(ToolError::Execution(message)) => {
+            assert!(message.contains("researcher"), "{message}");
+            assert!(message.contains("state must be an object"), "{message}");
+        }
+        other => panic!("expected malformed sub-agent state failure, got {other:?}"),
+    }
+    assert!(child_requests.lock().unwrap().is_empty());
 }
 
 async fn run_parent_once_with_sub_agent_call(
