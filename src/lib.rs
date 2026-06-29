@@ -25,8 +25,7 @@ pub use loop_runner::{AgentLoop, AgentLoopConfig, LoopError, LoopEvent, LoopOutp
 pub use planning::{Plan, PlanItem, PlanItemStatus, PlanToolSet};
 pub use provider::{ModelProvider, ModelRequest, ModelResponse, ModelStream};
 pub use run_state::{
-    BeforeModelCall, MODEL_MODE_STATE_KEY, ModelCallConfig, RunState, RunStateError,
-    StateInstructionPolicy,
+    BeforeModelCall, ModelCallConfig, RunOptions, RunState, RunStateError, StateInstructionPolicy,
 };
 pub use summarization::{ConversationSummary, PreparedMessages, SummaryPolicy};
 pub use tool::{FnTool, Tool, ToolError, ToolRegistry};

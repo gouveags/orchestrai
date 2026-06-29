@@ -4,9 +4,7 @@ use futures_util::StreamExt;
 
 use crate::{
     provider::{ModelProvider, ModelRequest, ModelResponse, ModelStreamEvent, ProviderError},
-    run_state::{
-        BeforeModelCall, MODEL_MODE_STATE_KEY, ModelCallConfig, RunState, StateInstructionPolicy,
-    },
+    run_state::{BeforeModelCall, ModelCallConfig, RunState, StateInstructionPolicy},
     summarization::{ConversationSummary, PreparedMessages, SummaryPolicy},
     tool::{ToolError, ToolRegistry},
     types::{Message, ToolCall, ToolResult},
@@ -24,6 +22,7 @@ pub(crate) type BeforeModelCallHook = Arc<
 pub(crate) struct RunStateCallOptions {
     pub instruction_policy: Option<StateInstructionPolicy>,
     pub model_modes: BTreeMap<String, String>,
+    pub model_mode: Option<String>,
     pub before_model_call: Option<BeforeModelCallHook>,
 }
 
@@ -310,7 +309,7 @@ where
     ) -> Result<PreparedRequest, LoopError> {
         let mut call = BeforeModelCall {
             state: state.clone(),
-            config: self.call_config_for_state(state, options),
+            config: self.call_config_for_state(options),
         };
 
         if let Some(hook) = &options.before_model_call {
@@ -333,14 +332,10 @@ where
         })
     }
 
-    fn call_config_for_state(
-        &self,
-        state: &RunState,
-        options: &RunStateCallOptions,
-    ) -> ModelCallConfig {
+    fn call_config_for_state(&self, options: &RunStateCallOptions) -> ModelCallConfig {
         let mut model = self.config.model.clone();
-        if let Some(mode) = state.get_string(MODEL_MODE_STATE_KEY) {
-            if let Some(mode_model) = options.model_modes.get(&mode) {
+        if let Some(mode) = &options.model_mode {
+            if let Some(mode_model) = options.model_modes.get(mode) {
                 model = mode_model.clone();
             }
         }

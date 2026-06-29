@@ -4,7 +4,7 @@ use crate::{
         RunStateCallOptions,
     },
     provider::ModelProvider,
-    run_state::{BeforeModelCall, RunState, StateInstructionPolicy},
+    run_state::{BeforeModelCall, RunOptions, RunState, StateInstructionPolicy},
     tool::{Tool, ToolRegistry},
     types::Message,
 };
@@ -129,6 +129,7 @@ where
             run_state_options: RunStateCallOptions {
                 instruction_policy: config.run_state_instructions,
                 model_modes: config.model_modes,
+                model_mode: None,
                 before_model_call: config.before_model_call,
             },
         }
@@ -143,8 +144,17 @@ where
         input: impl Into<String>,
         state: RunState,
     ) -> Result<AgentOutput, LoopError> {
-        self.run_messages_with_state(vec![Message::user(input.into())], state)
+        self.run_messages_with_state_and_mode(vec![Message::user(input.into())], state, None)
             .await
+    }
+
+    pub async fn run_with_options(&self, options: RunOptions) -> Result<AgentOutput, LoopError> {
+        self.run_messages_with_state_and_mode(
+            vec![Message::user(options.input)],
+            options.state,
+            options.model_mode,
+        )
+        .await
     }
 
     pub async fn run_messages(&self, messages: Vec<Message>) -> Result<AgentOutput, LoopError> {
@@ -156,12 +166,21 @@ where
         messages: Vec<Message>,
         state: RunState,
     ) -> Result<AgentOutput, LoopError> {
+        self.run_messages_with_state_and_mode(messages, state, None)
+            .await
+    }
+
+    async fn run_messages_with_state_and_mode(
+        &self,
+        messages: Vec<Message>,
+        state: RunState,
+        model_mode: Option<String>,
+    ) -> Result<AgentOutput, LoopError> {
+        let mut options = self.run_state_options.clone();
+        options.model_mode = model_mode;
+
         self.loop_runner
-            .run_with_state(
-                self.prepare_messages(messages),
-                state,
-                self.run_state_options.clone(),
-            )
+            .run_with_state(self.prepare_messages(messages), state, options)
             .await
     }
 

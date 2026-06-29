@@ -1,7 +1,5 @@
 use serde_json::{Map, Value};
 
-pub const MODEL_MODE_STATE_KEY: &str = "orchestrai.model_mode";
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunState {
     entries: Map<String, Value>,
@@ -80,6 +78,33 @@ pub struct ModelCallConfig {
 pub struct BeforeModelCall {
     pub state: RunState,
     pub config: ModelCallConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunOptions {
+    pub input: String,
+    pub state: RunState,
+    pub model_mode: Option<String>,
+}
+
+impl RunOptions {
+    pub fn new(input: impl Into<String>) -> Self {
+        Self {
+            input: input.into(),
+            state: RunState::new(),
+            model_mode: None,
+        }
+    }
+
+    pub fn with_state(mut self, state: RunState) -> Self {
+        self.state = state;
+        self
+    }
+
+    pub fn with_model_mode(mut self, model_mode: impl Into<String>) -> Self {
+        self.model_mode = Some(model_mode.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
