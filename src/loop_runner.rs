@@ -25,6 +25,16 @@ impl AgentLoopConfig {
         }
     }
 
+    pub fn with_max_tool_rounds(mut self, max_tool_rounds: usize) -> Self {
+        self.max_tool_rounds = max_tool_rounds;
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+
     pub fn with_summary_policy(mut self, summary_policy: SummaryPolicy) -> Self {
         self.summary_policy = Some(summary_policy);
         self
