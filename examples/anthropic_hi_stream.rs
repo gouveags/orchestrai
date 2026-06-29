@@ -9,11 +9,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")?;
     let provider = AnthropicProvider::new(api_key);
     let tools = ToolRegistry::new();
-    let config = AgentLoopConfig {
-        model: "claude-sonnet-4-6".to_owned(),
-        max_tool_rounds: 0,
-        max_tokens: Some(256),
-    };
+    let mut config = AgentLoopConfig::new("claude-sonnet-4-6");
+    config.max_tool_rounds = 0;
+    config.max_tokens = Some(256);
     let agent_loop = AgentLoop::new(provider, tools, config);
 
     let output = agent_loop
