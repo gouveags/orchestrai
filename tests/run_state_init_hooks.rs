@@ -10,8 +10,9 @@ use async_trait::async_trait;
 use futures_util::stream;
 use orchestrai::provider::{ModelStreamEvent, ProviderResult};
 use orchestrai::{
-    AgentConfig, FnTool, Message, ModelProvider, ModelRequest, ModelResponse, ModelStream,
-    RunOptions, RunState, StateInstructionPolicy, ToolCall, ToolDefinition, create_agent,
+    AgentConfig, FnTool, LoopError, Message, ModelProvider, ModelRequest, ModelResponse,
+    ModelStream, RunOptions, RunState, StateInstructionPolicy, ToolCall, ToolDefinition,
+    create_agent,
 };
 use serde_json::json;
 
@@ -156,6 +157,31 @@ async fn before_model_call_hook_resolves_state_and_config_before_every_llm_call(
             .messages
             .contains(&Message::tool("call_1", r#"{"tier":"enterprise"}"#))
     );
+}
+
+#[tokio::test]
+async fn unknown_explicit_model_mode_fails_before_provider_call() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let agent = create_agent(
+        AgentConfig::new(
+            RecordingProvider::new(vec![text_response("should not run")], Arc::clone(&requests)),
+            "fake-balanced",
+        )
+        .with_model_modes([("fast", "fake-fast")]),
+    );
+
+    let error = agent
+        .run_with_options(RunOptions::new("hello").with_model_mode("missing"))
+        .await
+        .unwrap_err();
+
+    match error {
+        LoopError::Provider(orchestrai::provider::ProviderError::Config(message)) => {
+            assert_eq!(message, "model mode `missing` is not configured");
+        }
+        other => panic!("expected model-mode configuration failure, got {other:?}"),
+    }
+    assert!(requests.lock().unwrap().is_empty());
 }
 
 fn assert_system_contains(request: &ModelRequest, expected: &str) {
