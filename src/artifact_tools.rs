@@ -121,6 +121,14 @@ impl LocalArtifactStore {
             self.ensure_in_root(&parent, &path)?;
         }
 
+        if target.exists() {
+            let resolved = target.canonicalize().map_err(|source| ArtifactError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            self.ensure_in_root(&resolved, &path)?;
+        }
+
         Ok(target)
     }
 

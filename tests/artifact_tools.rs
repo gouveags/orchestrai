@@ -80,3 +80,37 @@ async fn artifact_publish_rejects_root_escape_paths_as_hard_failures() {
             .contains("path `../secret.md` is outside the artifact root")
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn artifact_publish_rejects_existing_symlink_targets_outside_root() {
+    use std::{fs, os::unix::fs::symlink};
+
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    let link_path = temp.path().join("escape.md");
+    symlink(outside.path(), &link_path).unwrap();
+
+    let store = Arc::new(LocalArtifactStore::new(temp.path()).unwrap());
+    let mut registry = ToolRegistry::new();
+    register_artifact_tools(&mut registry, store);
+
+    let error = registry
+        .execute(
+            PUBLISH_ARTIFACT_TOOL,
+            json!({
+                "title": "Escape",
+                "content": "nope",
+                "path": "escape.md"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("path `escape.md` is outside the artifact root")
+    );
+    assert_eq!(fs::read_to_string(outside.path()).unwrap_or_default(), "");
+}
