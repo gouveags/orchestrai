@@ -316,8 +316,7 @@ where
                 options,
                 selection,
                 &mut on_event,
-                &run.id,
-                &mut run.usage_snapshot,
+                &mut run,
             )
             .await;
         self.finish_run(&run.id, output.is_ok(), run.usage_snapshot);
@@ -452,8 +451,7 @@ where
         options: RunStateCallOptions,
         selection: CapabilitySelection,
         on_event: &mut F,
-        run_id: &RunId,
-        usage_snapshot: &mut UsageSnapshot,
+        run: &mut ActiveRun,
     ) -> Result<LoopOutput, LoopError>
     where
         F: FnMut(LoopEvent) -> Fut + Send,
@@ -471,9 +469,9 @@ where
             let injected_summary = prepared.injected_summary;
             let model = prepared.request.model.clone();
             let delta = self.reserve_model_call()?;
-            usage_snapshot.add_assign(delta);
+            run.usage_snapshot.add_assign(delta);
             self.record_run_event(RunEvent::ModelCallStarted {
-                run_id: run_id.clone(),
+                run_id: run.id.clone(),
                 model: model.clone(),
             });
             self.record_telemetry(TelemetryEvent::ModelCallStarted {
@@ -524,9 +522,9 @@ where
                 model: model.clone(),
                 usage: response.usage.clone(),
             });
-            self.record_model_finished(run_id, &model, &response);
+            self.record_model_finished(&run.id, &model, &response);
             let delta = self.record_model_usage(&response);
-            usage_snapshot.add_assign(delta);
+            run.usage_snapshot.add_assign(delta);
             messages.push(Message::assistant_with_tool_calls(
                 response.message.clone(),
                 response.tool_calls.clone(),
@@ -539,8 +537,8 @@ where
                     messages,
                     tool_results: all_tool_results,
                     injected_summary,
-                    run_id: run_id.clone(),
-                    usage_snapshot: *usage_snapshot,
+                    run_id: run.id.clone(),
+                    usage_snapshot: run.usage_snapshot,
                 });
             }
 
@@ -552,7 +550,7 @@ where
                 .await;
 
                 let result = self
-                    .execute_tool_call(call, &context.tools, run_id, usage_snapshot)
+                    .execute_tool_call(call, &context.tools, &run.id, &mut run.usage_snapshot)
                     .await?;
 
                 on_event(LoopEvent::ToolFinished {
