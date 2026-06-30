@@ -30,9 +30,9 @@ OrchestrAI is not trying to be a graph framework. If your workflow is mostly
 ## Major Changes In This Version
 
 - `create_agent` is the main user-facing API for Rust and Python.
-- OpenAI, Anthropic Claude, and AWS Bedrock providers are available in Rust.
+- OpenAI, Anthropic Claude, and AWS Bedrock providers are available.
 - Python bindings can create provider-backed agents, register Python tools, and
-  run full-response or streaming calls.
+  run text, full-result, or streaming calls.
 - Model aliases and fallback policies let users ask for names like
   `team-regular` while routing to concrete provider models.
 - Run state can be injected into prompts with an explicit allowlist.
@@ -98,12 +98,16 @@ agent = orchestrai.create_agent(
     max_tool_rounds=4,
 )
 
-output = agent.run_output("Say hi from Python.")
-print(output["final_message"])
+response = agent.run("Say hi from Python.")
+print(response)
 ```
 
 Python `create_agent` reads `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` unless
-`api_key=` is passed directly. Bedrock is Rust-only for now.
+`api_key=` is passed directly. Bedrock reads standard AWS credentials and
+`AWS_REGION` or `AWS_DEFAULT_REGION`.
+
+Use `agent.run_full(...)` when you want the run id, final message, transcript,
+tool results, and usage.
 
 ## Stream Responses
 
@@ -123,7 +127,12 @@ Python:
 def on_delta(text: str) -> None:
     print(text, end="", flush=True)
 
-output = agent.run_stream("Explain the plan.", on_delta)
+def on_event(event: dict) -> None:
+    if event["type"] == "tool_started":
+        print(f"\nusing {event['name']}")
+
+result = agent.stream("Explain the plan.", on_delta=on_delta, on_event=on_event)
+print(result.usage)
 ```
 
 Streaming preserves the same instructions, state, tools, model routing, usage
@@ -166,16 +175,16 @@ let agent = create_agent(
 Python:
 
 ```python
-tools = orchestrai.ToolRegistry()
-tools.register_tool(
+tools = orchestrai.tools()
+tools.register(
     name="lookup_order",
     description="Look up an order by id.",
+    handler=lambda args: {"order": args["order_id"], "status": "ready"},
     input_schema={
         "type": "object",
         "properties": {"order_id": {"type": "string"}},
         "required": ["order_id"],
     },
-    handler=lambda args: {"order": args["order_id"], "status": "ready"},
 )
 
 agent = orchestrai.create_agent(
@@ -225,6 +234,31 @@ let agent = create_agent(AgentConfig::new(provider, "team-regular"));
 
 Fallbacks are explicit. Hard provider errors surface directly.
 
+Python can use the same idea with plain dictionaries:
+
+```python
+import os
+import orchestrai
+
+agent = orchestrai.create_agent(
+    model="team-regular",
+    providers={
+        "anthropic": {"api_key": os.environ["ANTHROPIC_API_KEY"]},
+        "openai": {"api_key": os.environ["OPENAI_API_KEY"]},
+    },
+    models={
+        "team-regular": [
+            {"provider": "anthropic", "model": "claude-sonnet-4-6"},
+            {"provider": "openai", "model": "gpt-4.1-mini"},
+        ],
+    },
+    fallback="transient",
+)
+```
+
+When `providers=` and `models=` are set, that routed configuration is the
+source of truth and the single-provider `provider=` option is not used.
+
 ## Pass Runtime State
 
 Run state is structured data provided per run. You decide which keys are allowed
@@ -257,6 +291,24 @@ let output = agent
 
 This keeps runtime inputs useful without letting every field become prompt
 context by accident.
+
+Python:
+
+```python
+agent = orchestrai.create_agent(
+    model="team-regular",
+    state_keys=["tenant_name", "plan_tier"],
+)
+
+result = agent.run(
+    "Draft the customer reply.",
+    state={
+        "tenant_name": "Acme",
+        "plan_tier": "pro",
+        "private_note": "not sent to the model",
+    },
+)
+```
 
 ## Load Prompts And Tools By Role
 
@@ -364,10 +416,12 @@ existing symlinks that point outside the artifact root.
 Python tool registries can also enable the built-ins:
 
 ```python
-tools = orchestrai.ToolRegistry()
-tools.register_planning_tools()
-tools.register_filesystem_tools("./workspace")
-tools.register_artifact_tools("./artifacts")
+tools = orchestrai.tools()
+tools.planning()
+tools.filesystem("./workspace")
+tools.artifacts("./artifacts")
+
+print([tool["name"] for tool in tools.definitions()])
 ```
 
 ## Summarize Without Losing Messages
@@ -449,6 +503,21 @@ let agent = create_agent(
 
 Limits fail closed before new expensive work starts.
 
+Python:
+
+```python
+agent = orchestrai.create_agent(
+    model="gpt-4.1-mini",
+    usage_limits={"max_runs": 100, "max_total_tokens": 1_000_000},
+    track_runs=True,
+)
+
+result = agent.run_full("Say hi.")
+print(result.usage)
+print(agent.usage())
+print(agent.run_events())
+```
+
 ## Run The Examples
 
 The Python examples show how to build several role-selected agents from one
@@ -496,6 +565,7 @@ cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo check --features python
+cargo check --tests --features python
 cargo check --examples
-python -m py_compile examples/agent_family_support/__init__.py examples/agent_family_*.py
+python -m py_compile scripts/hello_agent.py examples/agent_family_support/__init__.py examples/agent_family_*.py
 ```

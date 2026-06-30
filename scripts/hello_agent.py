@@ -75,7 +75,7 @@ def main() -> int:
         max_tool_rounds=0,
         max_tokens=args.max_tokens,
     )
-    response = agent.run(args.message)
+    response = agent.run_text(args.message)
 
     print(f"provider={args.provider}")
     print(f"model={model}")
