@@ -298,10 +298,10 @@ def workspace_root(role_id: str) -> Path:
 
 
 def build_tools(role: RoleDefinition, run: ExampleRunConfig) -> orchestrai.ToolRegistry:
-    registry = orchestrai.ToolRegistry()
-    registry.register_planning_tools()
-    registry.register_filesystem_tools(str(workspace_root(role.id)))
-    registry.register_artifact_tools(str(workspace_root(role.id) / "artifacts"))
+    registry = orchestrai.tools()
+    registry.planning()
+    registry.filesystem(str(workspace_root(role.id)))
+    registry.artifacts(str(workspace_root(role.id) / "artifacts"))
 
     for spec in role.tools:
         if spec.exclude_for_subagent and run.is_subagent:
@@ -330,7 +330,7 @@ def register_mock_tool(registry: orchestrai.ToolRegistry, spec: ToolSpec) -> Non
             ),
         }
 
-    registry.register_tool(
+    registry.register(
         spec.name,
         f"{spec.description}\n\nMocked in this public orchestrai example.",
         handler,
@@ -358,7 +358,7 @@ def register_agent_run_tool(registry: orchestrai.ToolRegistry, agents: Iterable[
             "excluded_tools": arguments.get("exclude_tools", []),
         }
 
-    registry.register_tool(
+    registry.register(
         "agent_run",
         "Run one mounted sub-agent through the common interface.",
         handler,
@@ -391,14 +391,16 @@ def build_agent(
         model=model,
         instructions="You are the shared orchestrai public example harness.",
         tools=build_tools(role, run),
-        default_prompts=base_prompts(role, run),
-        capability_prompts=role_prompts(role),
+        prompts=base_prompts(role, run),
+        bundles=role_prompts(role),
         state_keys=list(STATE_KEYS),
         model_modes={
             "fast": os.getenv("ORCHESTRAI_FAST_MODEL", model),
             "regular": os.getenv("ORCHESTRAI_REGULAR_MODEL", model),
             "max": os.getenv("ORCHESTRAI_MAX_MODEL", model),
         },
+        usage_limits={"max_total_tokens": 20_000},
+        track_runs=True,
         max_tokens=max_tokens,
         max_tool_rounds=max_tool_rounds,
     )
@@ -418,20 +420,22 @@ def run_role(
     state = build_state(role, run)
 
     if stream:
-        return agent.run_stream(
+        result = agent.stream(
             prompt,
             lambda delta: print(delta, end="", flush=True),
             state=state,
             capabilities=[role.bundle],
             model_mode="regular",
         )
+        return result.to_dict()
 
-    return agent.run_output(
+    result = agent.run_full(
         prompt,
         state=state,
         capabilities=[role.bundle],
         model_mode="regular",
     )
+    return result.to_dict()
 
 
 def print_role_output(role_name: str, output: dict) -> None:
