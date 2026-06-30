@@ -6,6 +6,7 @@ use crate::{
     },
     provider::{CachePolicy, ModelProvider},
     run_state::{BeforeModelCall, RunOptions, RunState, StateInstructionPolicy},
+    run_store::RunStore,
     telemetry::TelemetryConfig,
     tool::{Tool, ToolRegistry},
     types::Message,
@@ -36,6 +37,7 @@ pub struct AgentConfig<P> {
     pub(crate) model_modes: BTreeMap<String, String>,
     pub(crate) before_model_call: Option<BeforeModelCallHook>,
     pub(crate) telemetry: TelemetryConfig,
+    pub(crate) run_store: Arc<dyn RunStore>,
     pub(crate) usage_meter: UsageMeter,
     pub(crate) usage_limits: UsageLimits,
 }
@@ -55,6 +57,7 @@ impl<P> AgentConfig<P> {
             model_modes: BTreeMap::new(),
             before_model_call: None,
             telemetry: TelemetryConfig::default(),
+            run_store: Arc::new(crate::NoopRunStore),
             usage_meter: UsageMeter::default(),
             usage_limits: UsageLimits::default(),
         }
@@ -133,6 +136,14 @@ impl<P> AgentConfig<P> {
         self
     }
 
+    pub fn with_run_store<T>(mut self, run_store: T) -> Self
+    where
+        T: RunStore + 'static,
+    {
+        self.run_store = Arc::new(run_store);
+        self
+    }
+
     pub fn with_usage_meter(mut self, usage_meter: UsageMeter) -> Self {
         self.usage_meter = usage_meter;
         self
@@ -164,6 +175,7 @@ where
             .with_capability_bundles(config.capability_bundles)
             .with_cache_policy(config.cache_policy)
             .with_telemetry(config.telemetry)
+            .with_run_store_arc(config.run_store)
             .with_usage_meter(config.usage_meter)
             .with_usage_limits(config.usage_limits);
 
@@ -210,6 +222,20 @@ where
         .await
     }
 
+    pub async fn run_with_options_and_capabilities(
+        &self,
+        options: RunOptions,
+        selection: CapabilitySelection,
+    ) -> Result<AgentOutput, LoopError> {
+        self.run_messages_with_state_mode_and_capabilities(
+            vec![Message::user(options.input)],
+            options.state,
+            options.model_mode,
+            selection,
+        )
+        .await
+    }
+
     pub async fn run_messages(&self, messages: Vec<Message>) -> Result<AgentOutput, LoopError> {
         self.loop_runner.run(self.prepare_messages(messages)).await
     }
@@ -233,17 +259,48 @@ where
             .await
     }
 
+    pub async fn run_messages_with_state_and_capabilities(
+        &self,
+        messages: Vec<Message>,
+        state: RunState,
+        selection: CapabilitySelection,
+    ) -> Result<AgentOutput, LoopError> {
+        self.run_messages_with_state_mode_and_capabilities(messages, state, None, selection)
+            .await
+    }
+
     async fn run_messages_with_state_and_mode(
         &self,
         messages: Vec<Message>,
         state: RunState,
         model_mode: Option<String>,
     ) -> Result<AgentOutput, LoopError> {
+        self.run_messages_with_state_mode_and_capabilities(
+            messages,
+            state,
+            model_mode,
+            CapabilitySelection::default(),
+        )
+        .await
+    }
+
+    async fn run_messages_with_state_mode_and_capabilities(
+        &self,
+        messages: Vec<Message>,
+        state: RunState,
+        model_mode: Option<String>,
+        selection: CapabilitySelection,
+    ) -> Result<AgentOutput, LoopError> {
         let mut options = self.run_state_options.clone();
         options.model_mode = model_mode;
 
         self.loop_runner
-            .run_with_state(self.prepare_messages(messages), state, options)
+            .run_with_state_and_capabilities(
+                self.prepare_messages(messages),
+                state,
+                options,
+                selection,
+            )
             .await
     }
 
@@ -257,6 +314,30 @@ where
         Fut: std::future::Future<Output = ()> + Send,
     {
         self.run_messages_stream(vec![Message::user(input.into())], on_event)
+            .await
+    }
+
+    pub async fn run_stream_with_options_and_capabilities<F, Fut>(
+        &self,
+        options: RunOptions,
+        selection: CapabilitySelection,
+        on_event: F,
+    ) -> Result<AgentOutput, LoopError>
+    where
+        F: FnMut(LoopEvent) -> Fut + Send,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let mut run_state_options = self.run_state_options.clone();
+        run_state_options.model_mode = options.model_mode;
+
+        self.loop_runner
+            .run_stream_with_state_and_capabilities(
+                self.prepare_messages(vec![Message::user(options.input)]),
+                options.state,
+                run_state_options,
+                selection,
+                on_event,
+            )
             .await
     }
 

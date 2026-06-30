@@ -7,6 +7,7 @@ use crate::{
     provider::{CacheHint, CacheHintScope, CachePolicy, ProviderFeature},
     provider::{ModelProvider, ModelRequest, ModelResponse, ModelStreamEvent, ProviderError},
     run_state::{BeforeModelCall, ModelCallConfig, RunState, StateInstructionPolicy},
+    run_store::{NoopRunStore, RunEvent, RunId, RunStatus, RunStore},
     summarization::{ConversationSummary, PreparedMessages, SummaryPolicy},
     telemetry::{TelemetryConfig, TelemetryEvent},
     tool::{ToolError, ToolRegistry},
@@ -39,6 +40,7 @@ pub struct AgentLoopConfig {
     pub capability_bundles: CapabilityBundleSet,
     pub cache_policy: CachePolicy,
     pub telemetry: TelemetryConfig,
+    pub run_store: Arc<dyn RunStore>,
     pub usage_meter: UsageMeter,
     pub usage_limits: UsageLimits,
 }
@@ -53,6 +55,7 @@ impl AgentLoopConfig {
             capability_bundles: CapabilityBundleSet::new(),
             cache_policy: CachePolicy::disabled(),
             telemetry: TelemetryConfig::default(),
+            run_store: Arc::new(NoopRunStore),
             usage_meter: UsageMeter::default(),
             usage_limits: UsageLimits::default(),
         }
@@ -85,6 +88,19 @@ impl AgentLoopConfig {
 
     pub fn with_telemetry(mut self, telemetry: TelemetryConfig) -> Self {
         self.telemetry = telemetry;
+        self
+    }
+
+    pub fn with_run_store<T>(mut self, run_store: T) -> Self
+    where
+        T: RunStore + 'static,
+    {
+        self.run_store = Arc::new(run_store);
+        self
+    }
+
+    pub(crate) fn with_run_store_arc(mut self, run_store: Arc<dyn RunStore>) -> Self {
+        self.run_store = run_store;
         self
     }
 
@@ -127,11 +143,11 @@ where
         messages: Vec<Message>,
         selection: CapabilitySelection,
     ) -> Result<LoopOutput, LoopError> {
-        let mut usage_snapshot = self.start_run()?;
+        let mut run = self.start_run()?;
         let output = self
-            .run_with_capabilities_inner(messages, selection, &mut usage_snapshot)
+            .run_with_capabilities_inner(messages, selection, &run.id, &mut run.usage_snapshot)
             .await;
-        self.finish_run(output.is_ok());
+        self.finish_run(&run.id, output.is_ok(), run.usage_snapshot);
         output
     }
 
@@ -139,6 +155,7 @@ where
         &self,
         messages: Vec<Message>,
         selection: CapabilitySelection,
+        run_id: &RunId,
         usage_snapshot: &mut UsageSnapshot,
     ) -> Result<LoopOutput, LoopError> {
         let context = self.run_context(&selection)?;
@@ -147,7 +164,7 @@ where
 
         for _round in 0..=self.config.max_tool_rounds {
             let model_call = self
-                .call_model(messages.clone(), &context.tools, usage_snapshot)
+                .call_model(messages.clone(), &context.tools, run_id, usage_snapshot)
                 .await?;
             let injected_summary = model_call.injected_summary;
             let response = model_call.response;
@@ -162,12 +179,13 @@ where
                     messages,
                     tool_results: all_tool_results,
                     injected_summary,
+                    run_id: run_id.clone(),
                     usage_snapshot: *usage_snapshot,
                 });
             }
 
             let tool_results = self
-                .execute_tool_calls(&response.tool_calls, &context.tools, usage_snapshot)
+                .execute_tool_calls(&response.tool_calls, &context.tools, run_id, usage_snapshot)
                 .await?;
             for result in &tool_results {
                 messages.push(Message::tool(
@@ -181,17 +199,25 @@ where
         Err(LoopError::TooManyToolRounds(self.config.max_tool_rounds))
     }
 
-    pub(crate) async fn run_with_state(
+    pub(crate) async fn run_with_state_and_capabilities(
         &self,
         messages: Vec<Message>,
         state: RunState,
         options: RunStateCallOptions,
+        selection: CapabilitySelection,
     ) -> Result<LoopOutput, LoopError> {
-        let mut usage_snapshot = self.start_run()?;
+        let mut run = self.start_run()?;
         let output = self
-            .run_with_state_inner(messages, state, options, &mut usage_snapshot)
+            .run_with_state_inner(
+                messages,
+                state,
+                options,
+                selection,
+                &run.id,
+                &mut run.usage_snapshot,
+            )
             .await;
-        self.finish_run(output.is_ok());
+        self.finish_run(&run.id, output.is_ok(), run.usage_snapshot);
         output
     }
 
@@ -200,9 +226,11 @@ where
         messages: Vec<Message>,
         state: RunState,
         options: RunStateCallOptions,
+        selection: CapabilitySelection,
+        run_id: &RunId,
         usage_snapshot: &mut UsageSnapshot,
     ) -> Result<LoopOutput, LoopError> {
-        let context = self.run_context(&CapabilitySelection::default())?;
+        let context = self.run_context(&selection)?;
         let mut messages = apply_capability_prompts(messages, &context.prompts);
         let mut state = state;
         let mut all_tool_results = Vec::new();
@@ -214,6 +242,7 @@ where
                     &mut state,
                     &options,
                     &context.tools,
+                    run_id,
                     usage_snapshot,
                 )
                 .await?;
@@ -230,12 +259,13 @@ where
                     messages,
                     tool_results: all_tool_results,
                     injected_summary,
+                    run_id: run_id.clone(),
                     usage_snapshot: *usage_snapshot,
                 });
             }
 
             let tool_results = self
-                .execute_tool_calls(&response.tool_calls, &context.tools, usage_snapshot)
+                .execute_tool_calls(&response.tool_calls, &context.tools, run_id, usage_snapshot)
                 .await?;
             for result in &tool_results {
                 messages.push(Message::tool(
@@ -258,11 +288,38 @@ where
         F: FnMut(LoopEvent) -> Fut + Send,
         Fut: std::future::Future<Output = ()> + Send,
     {
-        let mut usage_snapshot = self.start_run()?;
+        let mut run = self.start_run()?;
         let output = self
-            .run_stream_inner(messages, &mut on_event, &mut usage_snapshot)
+            .run_stream_inner(messages, &mut on_event, &run.id, &mut run.usage_snapshot)
             .await;
-        self.finish_run(output.is_ok());
+        self.finish_run(&run.id, output.is_ok(), run.usage_snapshot);
+        output
+    }
+
+    pub(crate) async fn run_stream_with_state_and_capabilities<F, Fut>(
+        &self,
+        messages: Vec<Message>,
+        state: RunState,
+        options: RunStateCallOptions,
+        selection: CapabilitySelection,
+        mut on_event: F,
+    ) -> Result<LoopOutput, LoopError>
+    where
+        F: FnMut(LoopEvent) -> Fut + Send,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let mut run = self.start_run()?;
+        let output = self
+            .run_stream_with_state_inner(
+                messages,
+                state,
+                options,
+                selection,
+                &mut on_event,
+                &mut run,
+            )
+            .await;
+        self.finish_run(&run.id, output.is_ok(), run.usage_snapshot);
         output
     }
 
@@ -270,6 +327,7 @@ where
         &self,
         messages: Vec<Message>,
         on_event: &mut F,
+        run_id: &RunId,
         usage_snapshot: &mut UsageSnapshot,
     ) -> Result<LoopOutput, LoopError>
     where
@@ -286,6 +344,10 @@ where
             let model = prepared.request.model.clone();
             let delta = self.reserve_model_call()?;
             usage_snapshot.add_assign(delta);
+            self.record_run_event(RunEvent::ModelCallStarted {
+                run_id: run_id.clone(),
+                model: model.clone(),
+            });
             self.record_telemetry(TelemetryEvent::ModelCallStarted {
                 model: model.clone(),
             });
@@ -331,9 +393,10 @@ where
 
             let response = aggregation.finish()?;
             self.record_telemetry(TelemetryEvent::ModelCallFinished {
-                model,
+                model: model.clone(),
                 usage: response.usage.clone(),
             });
+            self.record_model_finished(run_id, &model, &response);
             let delta = self.record_model_usage(&response);
             usage_snapshot.add_assign(delta);
             messages.push(Message::assistant_with_tool_calls(
@@ -348,6 +411,7 @@ where
                     messages,
                     tool_results: all_tool_results,
                     injected_summary,
+                    run_id: run_id.clone(),
                     usage_snapshot: *usage_snapshot,
                 });
             }
@@ -360,7 +424,133 @@ where
                 .await;
 
                 let result = self
-                    .execute_tool_call(call, &context.tools, usage_snapshot)
+                    .execute_tool_call(call, &context.tools, run_id, usage_snapshot)
+                    .await?;
+
+                on_event(LoopEvent::ToolFinished {
+                    tool_call_id: result.tool_call_id.clone(),
+                    name: result.name.clone(),
+                    content: result.content.clone(),
+                })
+                .await;
+                messages.push(Message::tool(
+                    result.tool_call_id.clone(),
+                    result.content.clone(),
+                ));
+                all_tool_results.push(result);
+            }
+        }
+
+        Err(LoopError::TooManyToolRounds(self.config.max_tool_rounds))
+    }
+
+    async fn run_stream_with_state_inner<F, Fut>(
+        &self,
+        messages: Vec<Message>,
+        state: RunState,
+        options: RunStateCallOptions,
+        selection: CapabilitySelection,
+        on_event: &mut F,
+        run: &mut ActiveRun,
+    ) -> Result<LoopOutput, LoopError>
+    where
+        F: FnMut(LoopEvent) -> Fut + Send,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let context = self.run_context(&selection)?;
+        let mut messages = apply_capability_prompts(messages, &context.prompts);
+        let mut state = state;
+        let mut all_tool_results = Vec::new();
+
+        for _round in 0..=self.config.max_tool_rounds {
+            let prepared = self
+                .request_with_state(messages.clone(), &mut state, &options, &context.tools)
+                .await?;
+            let injected_summary = prepared.injected_summary;
+            let model = prepared.request.model.clone();
+            let delta = self.reserve_model_call()?;
+            run.usage_snapshot.add_assign(delta);
+            self.record_run_event(RunEvent::ModelCallStarted {
+                run_id: run.id.clone(),
+                model: model.clone(),
+            });
+            self.record_telemetry(TelemetryEvent::ModelCallStarted {
+                model: model.clone(),
+            });
+            let mut stream = self
+                .provider
+                .stream(prepared.request)
+                .await
+                .map_err(LoopError::Provider)?;
+            let mut aggregation = StreamAggregation::default();
+
+            while let Some(event) = stream.next().await {
+                let event = event.map_err(LoopError::Provider)?;
+                aggregation.apply(&event)?;
+
+                match event {
+                    ModelStreamEvent::MessageDelta(delta) => {
+                        on_event(LoopEvent::MessageDelta(delta)).await;
+                    }
+                    ModelStreamEvent::ToolCallDelta {
+                        index,
+                        id,
+                        name,
+                        arguments_delta,
+                    } => {
+                        on_event(LoopEvent::ToolCallDelta {
+                            index,
+                            id,
+                            name,
+                            arguments_delta,
+                        })
+                        .await;
+                    }
+                    ModelStreamEvent::Usage(usage) => {
+                        on_event(LoopEvent::Usage {
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                        })
+                        .await;
+                    }
+                    ModelStreamEvent::Done => {}
+                }
+            }
+
+            let response = aggregation.finish()?;
+            self.record_telemetry(TelemetryEvent::ModelCallFinished {
+                model: model.clone(),
+                usage: response.usage.clone(),
+            });
+            self.record_model_finished(&run.id, &model, &response);
+            let delta = self.record_model_usage(&response);
+            run.usage_snapshot.add_assign(delta);
+            messages.push(Message::assistant_with_tool_calls(
+                response.message.clone(),
+                response.tool_calls.clone(),
+            ));
+
+            if response.tool_calls.is_empty() {
+                on_event(LoopEvent::Done).await;
+                return Ok(LoopOutput {
+                    final_message: response.message,
+                    messages,
+                    tool_results: all_tool_results,
+                    injected_summary,
+                    run_id: run.id.clone(),
+                    usage_snapshot: run.usage_snapshot,
+                });
+            }
+
+            for call in &response.tool_calls {
+                on_event(LoopEvent::ToolStarted {
+                    tool_call_id: call.id.clone(),
+                    name: call.name.clone(),
+                })
+                .await;
+
+                let result = self
+                    .execute_tool_call(call, &context.tools, &run.id, &mut run.usage_snapshot)
                     .await?;
 
                 on_event(LoopEvent::ToolFinished {
@@ -384,12 +574,17 @@ where
         &self,
         messages: Vec<Message>,
         tools: &ToolRegistry,
+        run_id: &RunId,
         usage_snapshot: &mut UsageSnapshot,
     ) -> Result<ModelCall, LoopError> {
         let prepared = self.request(messages, tools)?;
         let delta = self.reserve_model_call()?;
         usage_snapshot.add_assign(delta);
         let model = prepared.request.model.clone();
+        self.record_run_event(RunEvent::ModelCallStarted {
+            run_id: run_id.clone(),
+            model: model.clone(),
+        });
         self.record_telemetry(TelemetryEvent::ModelCallStarted {
             model: model.clone(),
         });
@@ -399,9 +594,10 @@ where
             .await
             .map_err(LoopError::Provider)?;
         self.record_telemetry(TelemetryEvent::ModelCallFinished {
-            model,
+            model: model.clone(),
             usage: response.usage.clone(),
         });
+        self.record_model_finished(run_id, &model, &response);
         let delta = self.record_model_usage(&response);
         usage_snapshot.add_assign(delta);
 
@@ -417,6 +613,7 @@ where
         state: &mut RunState,
         options: &RunStateCallOptions,
         tools: &ToolRegistry,
+        run_id: &RunId,
         usage_snapshot: &mut UsageSnapshot,
     ) -> Result<ModelCall, LoopError> {
         let prepared = self
@@ -425,6 +622,10 @@ where
         let delta = self.reserve_model_call()?;
         usage_snapshot.add_assign(delta);
         let model = prepared.request.model.clone();
+        self.record_run_event(RunEvent::ModelCallStarted {
+            run_id: run_id.clone(),
+            model: model.clone(),
+        });
         self.record_telemetry(TelemetryEvent::ModelCallStarted {
             model: model.clone(),
         });
@@ -434,9 +635,10 @@ where
             .await
             .map_err(LoopError::Provider)?;
         self.record_telemetry(TelemetryEvent::ModelCallFinished {
-            model,
+            model: model.clone(),
             usage: response.usage.clone(),
         });
+        self.record_model_finished(run_id, &model, &response);
         let delta = self.record_model_usage(&response);
         usage_snapshot.add_assign(delta);
 
@@ -613,12 +815,16 @@ where
         &self,
         tool_calls: &[ToolCall],
         tools: &ToolRegistry,
+        run_id: &RunId,
         usage_snapshot: &mut UsageSnapshot,
     ) -> Result<Vec<ToolResult>, LoopError> {
         let mut results = Vec::with_capacity(tool_calls.len());
 
         for call in tool_calls {
-            results.push(self.execute_tool_call(call, tools, usage_snapshot).await?);
+            results.push(
+                self.execute_tool_call(call, tools, run_id, usage_snapshot)
+                    .await?,
+            );
         }
 
         Ok(results)
@@ -628,10 +834,16 @@ where
         &self,
         call: &ToolCall,
         tools: &ToolRegistry,
+        run_id: &RunId,
         usage_snapshot: &mut UsageSnapshot,
     ) -> Result<ToolResult, LoopError> {
         let delta = self.reserve_tool_call()?;
         usage_snapshot.add_assign(delta);
+        self.record_run_event(RunEvent::ToolCallStarted {
+            run_id: run_id.clone(),
+            tool_call_id: call.id.clone(),
+            name: call.name.clone(),
+        });
         self.record_telemetry(TelemetryEvent::ToolCallStarted {
             tool_call_id: call.id.clone(),
             name: call.name.clone(),
@@ -639,6 +851,13 @@ where
 
         match tools.execute(&call.name, call.arguments.clone()).await {
             Ok(content) => {
+                self.record_run_event(RunEvent::ToolCallFinished {
+                    run_id: run_id.clone(),
+                    tool_call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    is_error: false,
+                    recoverable: false,
+                });
                 self.record_telemetry(TelemetryEvent::ToolCallFinished {
                     tool_call_id: call.id.clone(),
                     name: call.name.clone(),
@@ -648,6 +867,13 @@ where
                 Ok(ToolResult::ok(call.id.clone(), call.name.clone(), content))
             }
             Err(ToolError::ResultContent(content)) => {
+                self.record_run_event(RunEvent::ToolCallFinished {
+                    run_id: run_id.clone(),
+                    tool_call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    is_error: true,
+                    recoverable: true,
+                });
                 self.record_telemetry(TelemetryEvent::ToolCallFinished {
                     tool_call_id: call.id.clone(),
                     name: call.name.clone(),
@@ -661,6 +887,13 @@ where
                 ))
             }
             Err(error) => {
+                self.record_run_event(RunEvent::ToolCallFinished {
+                    run_id: run_id.clone(),
+                    tool_call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    is_error: true,
+                    recoverable: false,
+                });
                 self.record_telemetry(TelemetryEvent::ToolCallFinished {
                     tool_call_id: call.id.clone(),
                     name: call.name.clone(),
@@ -672,16 +905,32 @@ where
         }
     }
 
-    fn start_run(&self) -> Result<UsageSnapshot, LoopError> {
+    fn start_run(&self) -> Result<ActiveRun, LoopError> {
         let delta = self
             .config
             .usage_meter
             .reserve_run(&self.config.usage_limits)?;
+        let run_id = self.config.run_store.start_run();
+        self.record_run_event(RunEvent::RunStarted {
+            run_id: run_id.clone(),
+        });
         self.record_telemetry(TelemetryEvent::RunStarted);
-        Ok(delta)
+        Ok(ActiveRun {
+            id: run_id,
+            usage_snapshot: delta,
+        })
     }
 
-    fn finish_run(&self, success: bool) {
+    fn finish_run(&self, run_id: &RunId, success: bool, usage_snapshot: UsageSnapshot) {
+        self.record_run_event(RunEvent::RunFinished {
+            run_id: run_id.clone(),
+            status: if success {
+                RunStatus::Succeeded
+            } else {
+                RunStatus::Failed
+            },
+            usage: usage_snapshot,
+        });
         self.record_telemetry(TelemetryEvent::RunFinished { success });
     }
 
@@ -708,6 +957,27 @@ where
     fn record_telemetry(&self, event: TelemetryEvent) {
         self.config.telemetry.record(event);
     }
+
+    fn record_run_event(&self, event: RunEvent) {
+        self.config.run_store.record(event);
+    }
+
+    fn record_model_finished(&self, run_id: &RunId, model: &str, response: &ModelResponse) {
+        self.record_run_event(RunEvent::ModelCallFinished {
+            run_id: run_id.clone(),
+            model: model.to_owned(),
+            input_tokens: response.usage.as_ref().and_then(|usage| usage.input_tokens),
+            output_tokens: response
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.output_tokens),
+        });
+    }
+}
+
+struct ActiveRun {
+    id: RunId,
+    usage_snapshot: UsageSnapshot,
 }
 
 struct RunContext {
@@ -727,6 +997,7 @@ struct ModelCall {
 
 #[derive(Debug, Clone)]
 pub struct LoopOutput {
+    pub run_id: RunId,
     pub final_message: String,
     pub messages: Vec<Message>,
     pub tool_results: Vec<ToolResult>,
