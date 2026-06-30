@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use futures_util::stream;
 use orchestrai::provider::{ModelStreamEvent, ProviderResult};
 use orchestrai::{
-    AgentConfig, FnTool, LoopError, Message, ModelProvider, ModelRequest, ModelResponse,
-    ModelStream, RunOptions, RunState, StateInstructionPolicy, ToolCall, ToolDefinition,
-    create_agent,
+    AgentConfig, CapabilityBundle, CapabilityBundleSet, CapabilitySelection, FnTool, LoopError,
+    Message, ModelProvider, ModelRequest, ModelResponse, ModelStream, RunOptions, RunState,
+    StateInstructionPolicy, ToolCall, ToolDefinition, create_agent,
 };
 use serde_json::json;
 
@@ -63,6 +63,73 @@ async fn run_state_renders_selected_entries_and_applies_builtin_model_mode() {
     assert_system_contains(&requests[0], "tenant_name: Acme Racing");
     assert_system_contains(&requests[0], "plan_tier: pro");
     assert_system_excludes(&requests[0], "private_note");
+}
+
+#[tokio::test]
+async fn run_options_can_select_capability_bundles_and_render_state_together() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let agent = create_agent(
+        AgentConfig::new(
+            RecordingProvider::new(vec![text_response("done")], Arc::clone(&requests)),
+            "fake-balanced",
+        )
+        .with_run_state_instructions(StateInstructionPolicy::selected([
+            "agent_role",
+            "permissions",
+        ]))
+        .with_model_modes([("regular", "fake-regular")])
+        .with_capability_bundles(
+            CapabilityBundleSet::new()
+                .with_default(
+                    CapabilityBundle::new("base").with_prompt("Base orchestration prompt."),
+                )
+                .with_bundle(
+                    "data",
+                    CapabilityBundle::new("data")
+                        .with_prompt("Data role prompt.")
+                        .with_tool(FnTool::new(
+                            ToolDefinition::new(
+                                "data.discovery",
+                                "Discover data.",
+                                json!({"type": "object"}),
+                            ),
+                            |_arguments| Box::pin(async { Ok("{}".to_owned()) }),
+                        )),
+                ),
+        ),
+    );
+
+    let output = agent
+        .run_with_options_and_capabilities(
+            RunOptions::new("Analyze the selected event.")
+                .with_state(
+                    RunState::from_json(json!({
+                        "agent_role": "data",
+                        "permissions": ["data_agent", "math_definition"],
+                        "private_runtime_secret": "not rendered"
+                    }))
+                    .unwrap(),
+                )
+                .with_model_mode("regular"),
+            CapabilitySelection::new(["data"]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(output.final_message, "done");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, "fake-regular");
+    assert_system_contains(&requests[0], "Base orchestration prompt.");
+    assert_system_contains(&requests[0], "Data role prompt.");
+    assert_system_contains(&requests[0], "agent_role: data");
+    assert_system_contains(
+        &requests[0],
+        "permissions: [\"data_agent\",\"math_definition\"]",
+    );
+    assert_system_excludes(&requests[0], "private_runtime_secret");
+    assert_eq!(requests[0].tools.len(), 1);
+    assert_eq!(requests[0].tools[0].name, "data.discovery");
 }
 
 #[tokio::test]
@@ -184,6 +251,41 @@ async fn unknown_explicit_model_mode_fails_before_provider_call() {
     assert!(requests.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn streamed_run_options_select_capabilities_and_render_state() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let agent = create_agent(
+        AgentConfig::new(
+            RecordingProvider::new(vec![text_response("unused")], Arc::clone(&requests)),
+            "fake-balanced",
+        )
+        .with_run_state_instructions(StateInstructionPolicy::selected(["agent_role"]))
+        .with_model_modes([("regular", "fake-regular")])
+        .with_capability_bundles(CapabilityBundleSet::new().with_bundle(
+            "data",
+            CapabilityBundle::new("data").with_prompt("Data role prompt."),
+        )),
+    );
+
+    let output = agent
+        .run_stream_with_options_and_capabilities(
+            RunOptions::new("Stream this.")
+                .with_state(RunState::from_json(json!({"agent_role": "data"})).unwrap())
+                .with_model_mode("regular"),
+            CapabilitySelection::new(["data"]),
+            |_| async {},
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(output.final_message, "streamed");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, "fake-regular");
+    assert_system_contains(&requests[0], "Data role prompt.");
+    assert_system_contains(&requests[0], "agent_role: data");
+}
+
 fn assert_system_contains(request: &ModelRequest, expected: &str) {
     assert!(
         request
@@ -237,7 +339,11 @@ impl ModelProvider for RecordingProvider {
         Ok(self.responses.lock().unwrap().pop_front().unwrap())
     }
 
-    async fn stream(&self, _request: ModelRequest) -> ProviderResult<ModelStream> {
-        Ok(Box::pin(stream::iter(vec![Ok(ModelStreamEvent::Done)])))
+    async fn stream(&self, request: ModelRequest) -> ProviderResult<ModelStream> {
+        self.requests.lock().unwrap().push(request);
+        Ok(Box::pin(stream::iter(vec![
+            Ok(ModelStreamEvent::MessageDelta("streamed".to_owned())),
+            Ok(ModelStreamEvent::Done),
+        ])))
     }
 }

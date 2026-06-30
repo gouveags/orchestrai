@@ -10,6 +10,10 @@ use crate::{
 
 type BuiltInPlanTool = FnTool<Box<dyn Fn(Value) -> BoxToolFuture + Send + Sync>>;
 
+pub const PLAN_CREATE_TOOL: &str = "plan_create";
+pub const PLAN_UPDATE_TOOL: &str = "plan_update";
+pub const PLAN_READ_TOOL: &str = "plan_read";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,7 +73,7 @@ impl PlanToolSet {
         let state = Arc::clone(&self.state);
         FnTool::new(
             ToolDefinition::new(
-                "plan.create",
+                PLAN_CREATE_TOOL,
                 "Create or replace the current plan with ordered items.",
                 json!({
                     "type": "object",
@@ -114,7 +118,7 @@ impl PlanToolSet {
         let state = Arc::clone(&self.state);
         FnTool::new(
             ToolDefinition::new(
-                "plan.update",
+                PLAN_UPDATE_TOOL,
                 "Update one item in the current plan.",
                 json!({
                     "type": "object",
@@ -175,7 +179,7 @@ impl PlanToolSet {
         let state = Arc::clone(&self.state);
         FnTool::new(
             ToolDefinition::new(
-                "plan.read",
+                PLAN_READ_TOOL,
                 "Read the current plan.",
                 json!({
                     "type": "object",
@@ -240,7 +244,7 @@ mod tests {
 
         registry
             .execute(
-                "plan.create",
+                PLAN_CREATE_TOOL,
                 json!({
                     "title": "Ship the feature",
                     "items": ["Write tests", "Implement code"]
@@ -249,11 +253,11 @@ mod tests {
             .await
             .unwrap();
         registry
-            .execute("plan.update", json!({"id": "1", "status": "completed"}))
+            .execute(PLAN_UPDATE_TOOL, json!({"id": "1", "status": "completed"}))
             .await
             .unwrap();
 
-        let output = registry.execute("plan.read", json!({})).await.unwrap();
+        let output = registry.execute(PLAN_READ_TOOL, json!({})).await.unwrap();
         let output: Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(output["plan"]["title"], "Ship the feature");

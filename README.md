@@ -23,9 +23,9 @@ This is not a graph framework.
 
 `PlanToolSet` registers three generic tools into any `ToolRegistry`:
 
-- `plan.create` replaces the current plan with ordered pending items
-- `plan.update` changes one item by id
-- `plan.read` returns the current plan as JSON
+- `plan_create` replaces the current plan with ordered pending items
+- `plan_update` changes one item by id
+- `plan_read` returns the current plan as JSON
 
 The toolset is intentionally small and in-memory. Storage belongs behind a
 future runtime/store interface, not in the first generic tool contract.
@@ -69,11 +69,67 @@ Normal file errors, such as a missing file, are returned as tool result content
 so the model can recover. Configuration and root-confinement failures are hard
 errors.
 
+## Artifact Tools
+
+Artifacts are generated outputs intended to outlive a single tool call, such as
+reports, charts, summaries, or exported data. `LocalArtifactStore` provides a
+small local implementation, and `register_artifact_tools` exposes three generic
+tools:
+
+- `artifact_publish` writes a text artifact and returns metadata
+- `artifact_list` lists artifacts published through the store
+- `artifact_read` reads a text artifact by id
+
+```rust
+use std::sync::Arc;
+
+use orchestrai::{
+    LocalArtifactStore, ToolRegistry, register_artifact_tools,
+};
+
+# fn example() -> Result<(), Box<dyn std::error::Error>> {
+let artifacts = Arc::new(LocalArtifactStore::new("./artifacts")?);
+let mut tools = ToolRegistry::new();
+register_artifact_tools(&mut tools, artifacts);
+# Ok(())
+# }
+```
+
+The local store rejects absolute paths and parent-directory escapes as hard
+errors. Remote artifact backends can implement `ArtifactStore` without changing
+the agent-facing tool contract.
+
 ## Development
 
 ```sh
 cargo run
 cargo test
+```
+
+## Agent Family Examples
+
+The agent-family examples are Python scripts that show how to build several
+role-selected agents with one shared harness:
+
+- `examples/agent_family_data.py`
+- `examples/agent_family_simulation.py`
+- `examples/agent_family_records.py`
+- `examples/agent_family_knowledge.py` (brief, wiki, and memory modes)
+- `examples/agent_family_vehicle.py`
+- `examples/agent_family_computing.py`
+- `examples/agent_family_real_llm.py` (runs every role, or a selected subset)
+
+They compose synthetic public prompts, role-selected capability bundles,
+run-state injection, planning and filesystem tools, usage accounting, and
+dynamic sub-agent mounting through the common `agent_run` tool. Domain tools are
+intentionally mocked with matching names and permission/exclusion behavior, so
+the examples validate orchestration shape without implying access to private
+systems.
+
+```sh
+maturin develop
+python examples/agent_family_data.py
+python examples/agent_family_real_llm.py data simulation
 ```
 
 ## Rust Agent API
@@ -128,6 +184,19 @@ impl TelemetrySink for Logger {
 let telemetry = TelemetryConfig::new().with_sink(Logger);
 ```
 
+Run identity and event storage are also opt-in. `InMemoryRunStore` is useful for
+tests and local applications; production hosts can implement `RunStore` to write
+sanitized lifecycle events elsewhere. Run-store events intentionally omit raw
+prompts, tool arguments, and tool result content.
+
+```rust
+use orchestrai::{AgentConfig, InMemoryRunStore};
+
+let run_store = InMemoryRunStore::new();
+let config = AgentConfig::new(provider, "gpt-4.1-mini")
+    .with_run_store(run_store.clone());
+```
+
 Usage accounting is also built into the base agent loop. `UsageMeter` can be
 shared across agents, `LoopOutput::usage_snapshot()` reports the per-run delta,
 and `UsageLimits` fails closed before provider calls when an existing budget is
@@ -149,8 +218,9 @@ let limits = UsageLimits::default().with_max_total_tokens(10_000);
 ## Python Bindings
 
 Python packaging is scaffolded with `pyo3` and `maturin` behind the `python`
-feature. The initial Python surface is intentionally tiny and currently supports
-an OpenAI-backed smoke path without Python-defined tools:
+feature. The Python surface supports provider-backed agents, Python-defined
+tools, built-in planning/filesystem tool registration, capability prompts,
+selected run-state injection, structured outputs, and streaming callbacks:
 
 ```python
 import orchestrai
@@ -163,9 +233,9 @@ agent = orchestrai.create_agent(
 print(agent.run("Say hi from Python."))
 ```
 
-`create_agent` reads `OPENAI_API_KEY` unless `api_key=` is provided. Python
-provider interop, Python-defined tools, streaming callbacks, and publishing
-automation are left for follow-up PRs.
+`create_agent` reads `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` unless `api_key=`
+is provided. Bedrock remains Rust-only for now. Publishing automation is left
+for a follow-up PR.
 
 ## Provider Credentials
 

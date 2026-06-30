@@ -1,8 +1,10 @@
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::types::Usage;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     pub runs: u64,
     /// Logical orchestrai model requests made by the loop. One call is one
