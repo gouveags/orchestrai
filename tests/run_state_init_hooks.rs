@@ -259,6 +259,7 @@ async fn streamed_run_options_select_capabilities_and_render_state() {
             RecordingProvider::new(vec![text_response("unused")], Arc::clone(&requests)),
             "fake-balanced",
         )
+        .with_instructions("You are a streaming copilot.")
         .with_run_state_instructions(StateInstructionPolicy::selected(["agent_role"]))
         .with_model_modes([("regular", "fake-regular")])
         .with_capability_bundles(CapabilityBundleSet::new().with_bundle(
@@ -282,6 +283,7 @@ async fn streamed_run_options_select_capabilities_and_render_state() {
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].model, "fake-regular");
+    assert_system_contains(&requests[0], "You are a streaming copilot.");
     assert_system_contains(&requests[0], "Data role prompt.");
     assert_system_contains(&requests[0], "agent_role: data");
 }

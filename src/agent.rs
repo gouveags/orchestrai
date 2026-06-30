@@ -332,7 +332,7 @@ where
 
         self.loop_runner
             .run_stream_with_state_and_capabilities(
-                vec![Message::user(options.input)],
+                self.prepare_messages(vec![Message::user(options.input)]),
                 options.state,
                 run_state_options,
                 selection,
